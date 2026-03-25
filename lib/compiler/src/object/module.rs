@@ -354,68 +354,72 @@ pub fn emit_compilation(
                     object::BinaryFormat::MachO => RelocationFlags::MachO {
                         r_type: macho::ARM64_RELOC_BRANCH26,
                         r_pcrel: true,
-                        r_length: 32,
+                        r_length: 2,
                     },
                     fmt => panic!("unsupported binary format {fmt:?}"),
                 },
                 Reloc::ElfX86_64TlsGd => RelocationFlags::Elf {
                     r_type: elf::R_X86_64_TLSGD,
                 },
+                // Mach-O ARM64 relocations.
+                // r_length uses log2 encoding: 0=1B, 1=2B, 2=4B, 3=8B
                 Reloc::MachoArm64RelocBranch26 => RelocationFlags::MachO {
                     r_type: macho::ARM64_RELOC_BRANCH26,
                     r_pcrel: true,
-                    r_length: 32,
+                    r_length: 2,
                 },
 
                 Reloc::MachoArm64RelocUnsigned => RelocationFlags::MachO {
                     r_type: macho::ARM64_RELOC_UNSIGNED,
-                    r_pcrel: true,
-                    r_length: 32,
+                    r_pcrel: false,
+                    r_length: 3,
                 },
                 Reloc::MachoArm64RelocSubtractor => RelocationFlags::MachO {
                     r_type: macho::ARM64_RELOC_SUBTRACTOR,
                     r_pcrel: false,
-                    r_length: 64,
+                    r_length: 3,
                 },
                 Reloc::MachoArm64RelocPage21 => RelocationFlags::MachO {
                     r_type: macho::ARM64_RELOC_PAGE21,
                     r_pcrel: true,
-                    r_length: 32,
+                    r_length: 2,
                 },
                 Reloc::MachoArm64RelocPageoff12 => RelocationFlags::MachO {
                     r_type: macho::ARM64_RELOC_PAGEOFF12,
                     r_pcrel: false,
-                    r_length: 32,
+                    r_length: 2,
                 },
                 Reloc::MachoArm64RelocGotLoadPage21 => RelocationFlags::MachO {
                     r_type: macho::ARM64_RELOC_GOT_LOAD_PAGE21,
                     r_pcrel: true,
-                    r_length: 32,
+                    r_length: 2,
                 },
                 Reloc::MachoArm64RelocGotLoadPageoff12 => RelocationFlags::MachO {
                     r_type: macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12,
-                    r_pcrel: true,
-                    r_length: 32,
+                    r_pcrel: false,
+                    r_length: 2,
                 },
+                // POINTER_TO_GOT can also be r_length=3 with r_pcrel=false for
+                // 64-bit absolute pointers. Wasmer uses the 32-bit PC-relative form.
                 Reloc::MachoArm64RelocPointerToGot => RelocationFlags::MachO {
                     r_type: macho::ARM64_RELOC_POINTER_TO_GOT,
                     r_pcrel: true,
-                    r_length: 32,
+                    r_length: 2,
                 },
                 Reloc::MachoArm64RelocTlvpLoadPage21 => RelocationFlags::MachO {
                     r_type: macho::ARM64_RELOC_TLVP_LOAD_PAGE21,
                     r_pcrel: true,
-                    r_length: 32,
+                    r_length: 2,
                 },
                 Reloc::MachoArm64RelocTlvpLoadPageoff12 => RelocationFlags::MachO {
                     r_type: macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12,
-                    r_pcrel: true,
-                    r_length: 32,
+                    r_pcrel: false,
+                    r_length: 2,
                 },
                 Reloc::MachoArm64RelocAddend => RelocationFlags::MachO {
                     r_type: macho::ARM64_RELOC_ADDEND,
                     r_pcrel: false,
-                    r_length: 32,
+                    r_length: 2,
                 },
                 // For RISC-V relocations, please refer to:
                 // https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/2484f950a551c653f1823f1bd11926bf5a57fae3/riscv-elf.adoc#relocations

@@ -128,13 +128,13 @@ wasmparser.workspace = true
 crossbeam-channel.workspace = true
 bus.workspace = true
 
-[target.'cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))'.dependencies.reqwest]
+[target.'cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64", target_os = "ios")))'.dependencies.reqwest]
 workspace = true
 default-features = false
 features = ["rustls", "json", "stream", "socks", "blocking"]
 optional = true
 
-[target.'cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))'.dependencies.reqwest]
+[target.'cfg(any(target_arch = "riscv64", target_arch = "loongarch64", target_os = "ios"))'.dependencies.reqwest]
 workspace = true
 default-features = false
 features = ["native-tls", "json", "stream", "socks", "blocking"]

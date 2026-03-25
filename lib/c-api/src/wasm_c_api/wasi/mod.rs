@@ -24,6 +24,8 @@ use wasmer_wasix::{
     default_fs_backing, get_wasi_version,
     runtime::task_manager::{tokio::TokioTaskManager, block_on},
 };
+use std::path::PathBuf;
+use wasmer_wasix::virtual_fs::FileSystem as _;
 
 #[derive(Debug)]
 #[allow(non_camel_case_types)]
@@ -33,6 +35,15 @@ pub struct wasi_config_t {
     inherit_stdin: bool,
     builder: WasiEnvBuilder,
     runtime: Option<tokio::runtime::Runtime>,
+    /// Mapped directories: (guest_alias, host_path).
+    /// These are tracked separately so we can set up filesystem mounts
+    /// in wasi_env_new, making the mapped directories visible to BinFactory
+    /// for proc_exec (running external WASM binaries from within bash).
+    mapped_dirs: Vec<(String, PathBuf)>,
+    /// Whether wasi_config_preopen_dir was called. Preopened dirs are
+    /// incompatible with mapped dirs (which use a TmpFileSystem sandbox),
+    /// so wasi_env_new returns an error if both are used.
+    has_preopen_dirs: bool,
 }
 
 #[unsafe(no_mangle)]
@@ -54,8 +65,10 @@ pub unsafe extern "C" fn wasi_config_new(
         inherit_stdout: true,
         inherit_stderr: true,
         inherit_stdin: true,
-        builder: WasiEnv::builder(prog_name).fs(default_fs_backing()),
+        builder: WasiEnv::builder(prog_name),
         runtime: Some(runtime),
+        mapped_dirs: Vec::new(),
+        has_preopen_dirs: false,
     }))
 }
 
@@ -106,6 +119,7 @@ pub unsafe extern "C" fn wasi_config_preopen_dir(
         return false;
     }
 
+    config.has_preopen_dirs = true;
     true
 }
 
@@ -135,10 +149,9 @@ pub unsafe extern "C" fn wasi_config_mapdir(
         }
     };
 
-    if let Err(e) = config.builder.add_map_dir(alias_str, dir_str) {
-        update_last_error(e);
-        return false;
-    }
+    // Record the mapping for filesystem setup in wasi_env_new.
+    // The alias is stored as-is; normalization happens during setup.
+    config.mapped_dirs.push((alias_str.to_string(), PathBuf::from(dir_str)));
 
     true
 }
@@ -404,6 +417,78 @@ pub unsafe extern "C" fn wasi_env_new(
         let (tx, stdin_rx) = Pipe::channel();
         config.builder.set_stdin(Box::new(stdin_rx));
         stdin_tx = Some(tx);
+    }
+
+    // Set up the filesystem with mounts for mapped directories.
+    // This uses a TmpFileSystem (like the CLI does) so that BinFactory can
+    // find executables at guest alias paths (e.g., /tools/jq) when bash
+    // invokes proc_exec to run external WASM binaries.
+    if !config.mapped_dirs.is_empty() {
+        if config.has_preopen_dirs {
+            update_last_error(
+                "wasi_config_preopen_dir and wasi_config_mapdir cannot be used together; \
+                 mapped directories use a sandboxed filesystem that preopened host paths \
+                 cannot resolve against"
+            );
+            return None;
+        }
+
+        // Normalize guest paths once: ensure leading "/" and pair with host dir.
+        let normalized: Vec<(String, PathBuf)> = config.mapped_dirs.iter().map(|(alias, host_dir)| {
+            let guest_path = if alias.starts_with('/') {
+                alias.clone()
+            } else {
+                format!("/{}", alias)
+            };
+            (guest_path, host_dir.clone())
+        }).collect();
+
+        // Use build_ext to exclude mapped guest paths from the default dirs,
+        // avoiding AlreadyExists errors if an alias matches /bin, /tmp, etc.
+        let guest_path_refs: Vec<&str> = normalized.iter().map(|(g, _)| g.as_str()).collect();
+        let root_fs = wasmer_wasix::virtual_fs::RootFileSystemBuilder::new()
+            .build_ext(&guest_path_refs);
+        let host_fs = default_fs_backing();
+
+        for (guest_path, host_dir) in &normalized {
+            // Create parent directories for nested guest paths.
+            // mount() creates the final component, but parents must exist first.
+            // Example: for /usr/local/bin, this creates /usr and /usr/local.
+            let guest_pb = PathBuf::from(guest_path);
+            if let Some(parent) = guest_pb.parent() {
+                if parent != std::path::Path::new("/") {
+                    let mut current = PathBuf::from("/");
+                    for component in parent.components().skip(1) {
+                        current.push(component);
+                        let _ = root_fs.create_dir(&current);
+                    }
+                }
+            }
+            if let Err(e) = root_fs.mount(
+                PathBuf::from(guest_path),
+                &host_fs,
+                host_dir.clone(),
+            ) {
+                update_last_error(format!("Failed to mount {} -> {:?}: {}", guest_path, host_dir, e));
+                return None;
+            }
+            // Use add_map_dir with the GUEST path (not the host path) since root_fs
+            // has a mount at the guest path that redirects to the host directory.
+            // This makes the preopened dir's Kind::Dir { path } point to the guest
+            // path, so both get_inode_at_path and BinFactory resolve through the mount.
+            if let Err(e) = config.builder.add_map_dir(guest_path, guest_path) {
+                update_last_error(e);
+                return None;
+            }
+        }
+        // sandbox_fs() and preopen_dir() consume self, so swap the builder out and back.
+        let builder = std::mem::replace(&mut config.builder, WasiEnv::builder(""));
+        let builder = c_try!(builder
+            .sandbox_fs(root_fs)
+            .preopen_dir(std::path::Path::new("/")));
+        config.builder = c_try!(builder.map_dir(".", "/"));
+    } else {
+        config.builder.set_fs(default_fs_backing());
     }
 
     let env = c_try!(

@@ -21,7 +21,7 @@ use std::{borrow::Cow, sync::Arc};
 use tracing::*;
 use virtual_mio::block_on;
 use wasmer::{Function, Memory32, Memory64, Module, RuntimeError, Store, Value};
-use wasmer_wasix_types::wasi::Errno;
+use wasmer_wasix_types::wasi::{Errno, ExitCode};
 
 #[tracing::instrument(level = "trace", skip_all, fields(%name, package_id=%binary.id))]
 pub async fn spawn_exec(
@@ -518,4 +518,70 @@ fn resume_vfork(
     } else {
         (store, Ok(None))
     }
+}
+
+/// Run a WASI/WASIX module's entrypoint using the same execution model as
+/// the Rust `WasiRunner`, including `ContextSwitchingEnvironment` for async
+/// context switching and `resume_vfork` for vfork handling.
+///
+/// This is intended for use by the C API where the caller has already
+/// created the store, module, and instance, but needs the correct execution
+/// model for WASIX features like `proc_fork` and pipes.
+///
+/// This is a simplified version of the `run_main_context` + `resume_vfork`
+/// + cleanup sequence in `call_module` above. It omits deep sleep handling,
+/// thread status tracking, and module recycling since those aren't needed
+/// for the C API use case.
+pub fn run_wasi_entrypoint(
+    ctx: &WasiFunctionEnv,
+    store: Store,
+    start: Function,
+) -> (Store, Result<Box<[Value]>, RuntimeError>) {
+    // Use ContextSwitchingEnvironment::run_main_context which handles
+    // async context switching needed for asyncify-based operations
+    let (mut store, mut call_ret) =
+        ContextSwitchingEnvironment::run_main_context(ctx, store, start.clone(), vec![]);
+
+    // Handle pending vforks (for the sync execution path fallback)
+    let store = loop {
+        store = match resume_vfork(ctx, store, &start, &call_ret) {
+            (store, Ok(Some(ret))) => {
+                call_ret = ret;
+                store
+            }
+            (store, Err(e)) => {
+                call_ret = Err(RuntimeError::user(Box::new(WasiError::Exit(e.into()))));
+                break store;
+            }
+            (store, Ok(None)) => break store,
+        };
+    };
+
+    // Clean up the WASI environment (flush and close file descriptors)
+    let exit_code = match &call_ret {
+        Ok(_) => Errno::Success.into(),
+        Err(err) => match err.downcast_ref::<WasiError>() {
+            Some(WasiError::Exit(code)) => *code,
+            Some(WasiError::ThreadExit) => Errno::Success.into(),
+            _ => {
+                // Asyncify unwinding can corrupt WasiError::Exit into
+                // unrelated traps (e.g., "indirect call type mismatch").
+                // Fall back to the exit code stored by proc_exit on the
+                // process object (which is shared across all contexts).
+                let explicit = ctx
+                    .data(&store)
+                    .process
+                    .explicit_exit_code
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if explicit >= 0 {
+                    ExitCode::from(explicit as u16)
+                } else {
+                    Errno::Noexec.into()
+                }
+            }
+        },
+    };
+    ctx.data(&store).blocking_on_exit(Some(exit_code));
+
+    (store, call_ret)
 }

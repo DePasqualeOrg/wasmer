@@ -18,10 +18,11 @@ use std::slice;
 use std::sync::Arc;
 #[cfg(feature = "webc_runner")]
 use wasmer_api::{AsStoreMut, Imports, Module};
+use wasmer_api::Memory;
 use wasmer_wasix::{
     Pipe, PluggableRuntime, WasiEnv, WasiEnvBuilder, WasiFunctionEnv, WasiVersion,
     default_fs_backing, get_wasi_version,
-    runtime::task_manager::tokio::TokioTaskManager,
+    runtime::task_manager::{tokio::TokioTaskManager, block_on},
 };
 
 #[derive(Debug)]
@@ -251,6 +252,10 @@ unsafe fn wasi_env_with_filesystem_inner(
         stdout_rx,
         stderr_rx,
         stdin_tx,
+        imported_memory: None,
+        // TODO: pass the tokio runtime handle from prepare_webc_env so that
+        // wasi_start can enter the runtime for this code path too
+        runtime_handle: None,
     }))
 }
 
@@ -332,7 +337,7 @@ fn prepare_webc_env(
     }
     let env = builder.finalize(store).ok()?;
 
-    let import_object = env.import_object(store, module).ok()?;
+    let import_object = env.import_object_for_all_wasi_versions(store, module).ok()?;
     Some((env, import_object, stdout_rx, stderr_rx, stdin_tx))
 }
 
@@ -347,6 +352,12 @@ pub struct wasi_env_t {
     stderr_rx: Option<Pipe>,
     /// Host-side write end for captured stdin
     stdin_tx: Option<Pipe>,
+    /// Memory for WASIX modules that import rather than export memory
+    imported_memory: Option<Memory>,
+    /// Tokio runtime handle for entering the async context during execution.
+    /// WASIX modules that use proc_fork need the tokio runtime to be active
+    /// on the calling thread so that child tasks can be properly scheduled.
+    runtime_handle: Option<tokio::runtime::Handle>,
 }
 
 /// Create a new WASI environment.
@@ -408,6 +419,8 @@ pub unsafe extern "C" fn wasi_env_new(
         stdout_rx,
         stderr_rx,
         stdin_tx,
+        imported_memory: None,
+        runtime_handle: Some(handle),
     }))
 }
 
@@ -524,6 +537,138 @@ pub extern "C" fn wasi_env_close_stdin(env: &mut wasi_env_t) {
     }
 }
 
+/// Wait for all child processes spawned by WASIX `proc_fork` to finish.
+///
+/// WASIX modules (e.g., bash) fork child processes for pipes and subshells.
+/// `wasm_func_call` returns as soon as the main process calls `proc_exit`,
+/// but forked children may still be running. Call this after `wasm_func_call`
+/// and before reading stdout/stderr to ensure all output has been written.
+/// Returns `true` if children were waited on, `false` if there were no children.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wasi_env_join_children(env: &mut wasi_env_t) -> bool {
+    let _guard = env.runtime_handle.as_ref().map(|h| h.enter());
+
+    let store = unsafe { env.store.store() };
+    let data = env.inner.data(&store);
+    let mut process = data.process.clone();
+    // Release the store borrow before blocking; join_children doesn't need store access
+    drop(store);
+
+    block_on(async { process.join_children().await }).is_some()
+}
+
+/// Run a WASI/WASIX module's `_start` function with proper async runtime
+/// and context-switching support.
+///
+/// This is the recommended way to run WASIX modules (e.g., bash) that use
+/// `proc_fork`, pipes, or subshells. It uses the same async execution model
+/// as the Rust `WasiRunner`, including context switching for asyncify-based
+/// operations like `proc_fork`.
+///
+/// Call this after `wasi_env_initialize_instance`. Returns NULL when the
+/// program runs to completion (including any `proc_exit` call, regardless
+/// of exit code), or a trap for runtime-level errors. The caller should
+/// delete any returned trap, and use `wasi_env_get_exit_code` to get the
+/// program's exit code.
+///
+/// For WASIX modules that fork child processes (e.g., bash with pipes),
+/// call `wasi_env_join_children` before reading stdout/stderr to ensure
+/// all child output has been flushed.
+///
+/// After this returns, call `wasi_env_read_stdout` / `wasi_env_read_stderr`
+/// to read captured output, and `wasi_env_get_exit_code` for the exit code.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wasi_start(
+    wasi_env: &mut wasi_env_t,
+    store: &mut wasm_store_t,
+    instance: &wasm_instance_t,
+) -> Option<Box<crate::wasm_c_api::trap::wasm_trap_t>> {
+    // Enter the tokio runtime so WASIX child tasks can be scheduled
+    let Some(handle) = wasi_env.runtime_handle.as_ref() else {
+        update_last_error("wasi_start requires a tokio runtime; use wasi_env_new (not wasi_env_with_filesystem)");
+        return Some(Box::new(crate::wasm_c_api::trap::wasm_trap_t::from(
+            wasmer_api::RuntimeError::new("No tokio runtime handle available"),
+        )));
+    };
+    let _guard = handle.enter();
+
+    debug_assert!(
+        wasi_env.store.ptr_eq(&store.inner),
+        "wasi_start: store must be the same one passed to wasi_env_new"
+    );
+
+    // Get the _start function
+    let start = match instance.inner.exports.get_function("_start") {
+        Ok(func) => func.clone(),
+        Err(_) => {
+            update_last_error("Module has no _start function");
+            return Some(Box::new(crate::wasm_c_api::trap::wasm_trap_t::from(
+                wasmer_api::RuntimeError::new("Module has no _start function"),
+            )));
+        }
+    };
+
+    // Temporarily take ownership of the Store so we can use the async
+    // execution model (ContextSwitchingEnvironment::run_main_context) which
+    // requires Store by value.
+    let result = unsafe {
+        store.inner.with_owned_store(|owned_store| {
+            wasmer_wasix::bin_factory::run_wasi_entrypoint(
+                &wasi_env.inner,
+                owned_store,
+                start,
+            )
+        })
+    };
+
+    match result {
+        Ok(_) => None,
+        Err(e) => {
+            // WASI programs exit via proc_exit, which produces a RuntimeError.
+            // All proc_exit calls (zero and non-zero) are normal completions —
+            // the caller should use wasi_env_get_exit_code for the exit code.
+            // Only return a trap for actual runtime errors.
+            match e.downcast_ref::<wasmer_wasix::WasiError>() {
+                Some(wasmer_wasix::WasiError::Exit(_)) => None,
+                Some(wasmer_wasix::WasiError::ThreadExit) => None,
+                _ => Some(Box::new(e.into())),
+            }
+        }
+    }
+}
+
+/// Get the exit code from the WASI environment after execution.
+///
+/// WASIX modules call `proc_exit` to set their exit code on the process
+/// object. This function reads that exit code directly, which is more
+/// reliable than parsing trap messages (since asyncify unwinding can
+/// produce unrelated traps like "indirect call type mismatch").
+///
+/// Returns -1 if the process has not yet finished. Returns 1 as a
+/// fallback if the process terminated with an error that could not be
+/// mapped to an exit code (e.g., asyncify corruption).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wasi_env_get_exit_code(
+    wasi_env: &wasi_env_t,
+) -> i32 {
+    let store = unsafe { wasi_env.store.store() };
+    let env = wasi_env.inner.env.as_ref(&store);
+    match env.process.try_join() {
+        Some(Ok(code)) => code.raw(),
+        Some(Err(err)) => {
+            err.as_exit_code()
+                .map(|c| c.raw())
+                .unwrap_or_else(|| {
+                    // Asyncify may have corrupted the error; fall back to
+                    // the exit code stored by proc_exit before unwinding.
+                    let explicit = env.process.explicit_exit_code();
+                    if explicit >= 0 { explicit } else { 1 }
+                })
+        }
+        None => -1,
+    }
+}
+
 /// The version of WASI. This is determined by the imports namespace
 /// string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -615,7 +760,9 @@ unsafe fn wasi_get_imports_inner(
 
     let mut import_object = {
         let mut store_mut = unsafe { store.store_mut() };
-        c_try!(wasi_env.inner.import_object(&mut store_mut, &module.inner))
+        c_try!(wasi_env
+            .inner
+            .import_object_for_all_wasi_versions(&mut store_mut, &module.inner))
     };
 
     let shared_memory = module.inner.imports().memories().next().map(|a| *a.ty());
@@ -640,7 +787,9 @@ unsafe fn wasi_get_imports_inner(
     };
 
     if let Some(memory) = memory {
-        import_object.define("env", "memory", memory);
+        import_object.define("env", "memory", memory.clone());
+        // Store the memory for WASIX modules that import rather than export it
+        wasi_env.imported_memory = Some(memory);
     }
 
     imports_set_buffer(store, &module.inner, import_object, imports)?;
@@ -683,11 +832,38 @@ pub unsafe extern "C" fn wasi_env_initialize_instance(
     instance: &mut wasm_instance_t,
 ) -> bool {
     let mut store_mut = unsafe { store.inner.store_mut() };
-    wasi_env
+
+    // Try the normal path first (exported memory — standard WASI modules)
+    match wasi_env
         .inner
         .initialize(&mut store_mut, instance.inner.clone())
-        .unwrap();
-    true
+    {
+        Ok(()) => return true,
+        Err(wasmer_api::ExportError::Missing(_)) => {
+            // No exported memory — expected for WASIX modules, fall through
+        }
+        Err(e) => {
+            update_last_error(format!("Failed to initialize WASI instance: {e}"));
+            return false;
+        }
+    }
+
+    // Fall back to imported memory (WASIX modules import memory via "env"."memory")
+    if let Some(memory) = wasi_env.imported_memory.clone() {
+        match wasi_env
+            .inner
+            .initialize_with_memory(&mut store_mut, instance.inner.clone(), memory)
+        {
+            Ok(()) => return true,
+            Err(e) => {
+                update_last_error(format!("Failed to initialize WASI instance: {e}"));
+                return false;
+            }
+        }
+    }
+
+    update_last_error("No exported or imported memory found");
+    false
 }
 
 #[unsafe(no_mangle)]

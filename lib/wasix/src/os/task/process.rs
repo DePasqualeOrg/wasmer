@@ -10,7 +10,7 @@ use std::{
     ops::Range,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, RwLock, Weak,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicI32, AtomicU32, Ordering},
     },
     task::Waker,
     time::Duration,
@@ -111,6 +111,9 @@ pub struct WasiProcess {
     /// the exponential backoff of CPU is halted (as in CPU
     /// is allowed to run freely)
     pub(crate) cpu_run_tokens: Arc<AtomicU32>,
+    /// Exit code recorded by `proc_exit` before the error propagates
+    /// through asyncify. -1 means no exit code has been recorded.
+    pub(crate) explicit_exit_code: Arc<AtomicI32>,
 }
 
 /// Represents a freeze of all threads to perform some action
@@ -469,6 +472,7 @@ impl WasiProcess {
             ),
             waiting,
             cpu_run_tokens: Arc::new(AtomicU32::new(0)),
+            explicit_exit_code: Arc::new(AtomicI32::new(-1)),
         }
     }
 
@@ -771,6 +775,12 @@ impl WasiProcess {
     /// Attempts to join on the process
     pub fn try_join(&self) -> Option<Result<ExitCode, Arc<WasiRuntimeError>>> {
         self.finished.status().into_finished()
+    }
+
+    /// Returns the exit code stored by `proc_exit` before asyncify unwinding,
+    /// or -1 if `proc_exit` was not called.
+    pub fn explicit_exit_code(&self) -> i32 {
+        self.explicit_exit_code.load(Ordering::Acquire)
     }
 
     /// Waits for all the children to be finished

@@ -17,7 +17,13 @@ pub fn proc_exit2<M: MemorySize>(
     WasiEnv::do_pending_operations(&mut ctx)?;
 
     let Some(mut vfork) = ctx.data_mut().vfork.take() else {
-        // Not in a vfork, just exit normally
+        // Store the exit code on the process so it survives asyncify
+        // unwinding (which can corrupt the WasiError::Exit into an
+        // unrelated trap like "indirect call type mismatch").
+        ctx.data()
+            .process
+            .explicit_exit_code
+            .store(code.raw(), std::sync::atomic::Ordering::Release);
         return Err(WasiError::Exit(code));
     };
 

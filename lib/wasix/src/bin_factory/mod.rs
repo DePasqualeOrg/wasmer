@@ -20,8 +20,8 @@ mod exec;
 pub use self::{
     binary_package::*,
     exec::{
-        package_command_by_name, run_exec, spawn_exec, spawn_exec_module, spawn_exec_wasm,
-        spawn_load_module, spawn_union_fs,
+        package_command_by_name, run_exec, run_wasi_entrypoint, spawn_exec, spawn_exec_module,
+        spawn_exec_wasm, spawn_load_module, spawn_union_fs,
     },
 };
 use crate::{

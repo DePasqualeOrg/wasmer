@@ -123,7 +123,8 @@ impl WasiFunctionEnv {
     /// (this must be executed before attempting to use it)
     /// (as the stores can not by themselves be passed between threads we can store the module
     ///  in a thread-local variables and use it later - for multithreading)
-    // FIXME: this probably doesn't work with WASIX modules, since they import their memories?
+    // Note: This assumes exported memory. For WASIX modules that import memory,
+    // use `initialize_with_memory` instead.
     pub fn initialize(
         &mut self,
         store: &mut impl AsStoreMut,
@@ -147,6 +148,28 @@ impl WasiFunctionEnv {
             instance.clone(),
             WasiModuleTreeHandles::Static(WasiModuleInstanceHandles::new(
                 exported_memory,
+                store,
+                instance,
+                None,
+            )),
+            None,
+            true,
+        )
+    }
+
+    /// Like [`Self::initialize`], but accepts an explicit memory for modules that import
+    /// memory rather than exporting it (e.g., WASIX modules with shared memory).
+    pub fn initialize_with_memory(
+        &mut self,
+        store: &mut impl AsStoreMut,
+        instance: Instance,
+        memory: Memory,
+    ) -> Result<(), ExportError> {
+        self.initialize_handles_and_layout(
+            store,
+            instance.clone(),
+            WasiModuleTreeHandles::Static(WasiModuleInstanceHandles::new(
+                memory,
                 store,
                 instance,
                 None,

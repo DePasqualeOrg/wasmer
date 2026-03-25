@@ -21,9 +21,7 @@ use wasmer_api::{AsStoreMut, Imports, Module};
 use wasmer_wasix::{
     Pipe, PluggableRuntime, WasiEnv, WasiEnvBuilder, WasiFunctionEnv, WasiVersion,
     default_fs_backing, get_wasi_version,
-    runtime::task_manager::{block_on, tokio::TokioTaskManager},
-    virtual_fs::AsyncReadExt,
-    virtual_fs::VirtualFile,
+    runtime::task_manager::tokio::TokioTaskManager,
 };
 
 #[derive(Debug)]
@@ -164,10 +162,10 @@ pub extern "C" fn wasi_config_inherit_stderr(config: &mut wasi_config_t) {
     config.inherit_stderr = true;
 }
 
-//#[unsafe(no_mangle)]
-//pub extern "C" fn wasi_config_capture_stdin(config: &mut wasi_config_t) {
-//    config.inherit_stdin = false;
-//}
+#[unsafe(no_mangle)]
+pub extern "C" fn wasi_config_capture_stdin(config: &mut wasi_config_t) {
+    config.inherit_stdin = false;
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wasi_config_inherit_stdin(config: &mut wasi_config_t) {
@@ -233,7 +231,7 @@ unsafe fn wasi_env_with_filesystem_inner(
     #[allow(clippy::unnecessary_cast)]
     let fs_bytes = unsafe { &*(fs.ptr as *const u8) };
 
-    let (wasi_env, import_object) = {
+    let (wasi_env, import_object, stdout_rx, stderr_rx, stdin_tx) = {
         let mut store_mut = unsafe { store.store_mut() };
         prepare_webc_env(
             config,
@@ -250,6 +248,9 @@ unsafe fn wasi_env_with_filesystem_inner(
     Some(Box::new(wasi_env_t {
         inner: wasi_env,
         store: store.clone(),
+        stdout_rx,
+        stderr_rx,
+        stdin_tx,
     }))
 }
 
@@ -261,7 +262,7 @@ fn prepare_webc_env(
     bytes: &'static u8,
     len: usize,
     package_name: &str,
-) -> Option<(WasiFunctionEnv, Imports)> {
+) -> Option<(WasiFunctionEnv, Imports, Option<Pipe>, Option<Pipe>, Option<Pipe>)> {
     use virtual_fs::static_fs::StaticFileSystem;
     use wasmer_wasix::virtual_fs::FileSystem;
     use webc::v1::{FsEntryType, WebC};
@@ -301,12 +302,25 @@ fn prepare_webc_env(
         Arc::new(StaticFileSystem::init(slice, package_name)?) as Arc<dyn FileSystem + Send + Sync>;
     let mut builder = config.builder.runtime(Arc::new(rt));
 
+    let mut stdout_rx = None;
     if !config.inherit_stdout {
-        builder.set_stdout(Box::new(Pipe::channel().0));
+        let (stdout_tx, rx) = Pipe::channel();
+        builder.set_stdout(Box::new(stdout_tx));
+        stdout_rx = Some(rx);
     }
 
+    let mut stderr_rx = None;
     if !config.inherit_stderr {
-        builder.set_stderr(Box::new(Pipe::channel().0));
+        let (stderr_tx, rx) = Pipe::channel();
+        builder.set_stderr(Box::new(stderr_tx));
+        stderr_rx = Some(rx);
+    }
+
+    let mut stdin_tx = None;
+    if !config.inherit_stdin {
+        let (tx, stdin_rx) = Pipe::channel();
+        builder.set_stdin(Box::new(stdin_rx));
+        stdin_tx = Some(tx);
     }
 
     builder.set_fs(filesystem);
@@ -319,7 +333,7 @@ fn prepare_webc_env(
     let env = builder.finalize(store).ok()?;
 
     let import_object = env.import_object(store, module).ok()?;
-    Some((env, import_object))
+    Some((env, import_object, stdout_rx, stderr_rx, stdin_tx))
 }
 
 #[allow(non_camel_case_types)]
@@ -327,6 +341,12 @@ pub struct wasi_env_t {
     /// cbindgen:ignore
     pub(super) inner: WasiFunctionEnv,
     pub(super) store: StoreRef,
+    /// Host-side read end for captured stdout
+    stdout_rx: Option<Pipe>,
+    /// Host-side read end for captured stderr
+    stderr_rx: Option<Pipe>,
+    /// Host-side write end for captured stdin
+    stdin_tx: Option<Pipe>,
 }
 
 /// Create a new WASI environment.
@@ -354,15 +374,26 @@ pub unsafe extern "C" fn wasi_env_new(
     let mut rt = PluggableRuntime::new(Arc::new(TokioTaskManager::new(runtime)));
     rt.set_engine(store_mut.engine().clone());
 
+    let mut stdout_rx = None;
     if !config.inherit_stdout {
-        config.builder.set_stdout(Box::new(Pipe::channel().0));
+        let (stdout_tx, rx) = Pipe::channel();
+        config.builder.set_stdout(Box::new(stdout_tx));
+        stdout_rx = Some(rx);
     }
 
+    let mut stderr_rx = None;
     if !config.inherit_stderr {
-        config.builder.set_stderr(Box::new(Pipe::channel().0));
+        let (stderr_tx, rx) = Pipe::channel();
+        config.builder.set_stderr(Box::new(stderr_tx));
+        stderr_rx = Some(rx);
     }
 
-    // TODO: impl capturer for stdin
+    let mut stdin_tx = None;
+    if !config.inherit_stdin {
+        let (tx, stdin_rx) = Pipe::channel();
+        config.builder.set_stdin(Box::new(stdin_rx));
+        stdin_tx = Some(tx);
+    }
 
     let env = c_try!(
         config
@@ -374,6 +405,9 @@ pub unsafe extern "C" fn wasi_env_new(
     Some(Box::new(wasi_env_t {
         inner: env,
         store: store.clone(),
+        stdout_rx,
+        stderr_rx,
+        stdin_tx,
     }))
 }
 
@@ -396,6 +430,11 @@ pub unsafe extern "C" fn wasi_env_set_memory(_env: &mut wasi_env_t, _memory: &wa
     panic!("wasmer_env_set_memory() is not supported");
 }
 
+/// Read captured stdout data into `buffer`.
+///
+/// Returns the number of bytes read, 0 if no data is available, or -1 on
+/// error (e.g., stdout was not captured). This function is non-blocking;
+/// for reliable results, call after the WASM module has finished execution.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasi_env_read_stdout(
     env: &mut wasi_env_t,
@@ -403,26 +442,20 @@ pub unsafe extern "C" fn wasi_env_read_stdout(
     buffer_len: usize,
 ) -> isize {
     let inner_buffer = unsafe { slice::from_raw_parts_mut(buffer as *mut _, buffer_len) };
-    let store = unsafe { env.store.store() };
 
-    let stdout = {
-        let data = env.inner.data(&store);
-        data.stdout()
-    };
-
-    if let Ok(mut stdout) = stdout {
-        if let Some(stdout) = stdout.as_mut() {
-            read_inner(stdout, inner_buffer)
-        } else {
-            update_last_error("could not find a file handle for `stdout`");
-            -1
-        }
+    if let Some(ref mut stdout_rx) = env.stdout_rx {
+        read_pipe(stdout_rx, inner_buffer)
     } else {
-        update_last_error("could not find a file handle for `stdout`");
+        update_last_error("stdout is not captured; call wasi_config_capture_stdout first");
         -1
     }
 }
 
+/// Read captured stderr data into `buffer`.
+///
+/// Returns the number of bytes read, 0 if no data is available, or -1 on
+/// error (e.g., stderr was not captured). This function is non-blocking;
+/// for reliable results, call after the WASM module has finished execution.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasi_env_read_stderr(
     env: &mut wasi_env_t,
@@ -430,37 +463,65 @@ pub unsafe extern "C" fn wasi_env_read_stderr(
     buffer_len: usize,
 ) -> isize {
     let inner_buffer = unsafe { slice::from_raw_parts_mut(buffer as *mut _, buffer_len) };
-    let store = unsafe { env.store.store() };
-    let stderr = {
-        let data = env.inner.data(&store);
-        data.stderr()
-    };
-    if let Ok(mut stderr) = stderr {
-        if let Some(stderr) = stderr.as_mut() {
-            read_inner(stderr, inner_buffer)
-        } else {
-            update_last_error("could not find a file handle for `stderr`");
-            -1
-        }
+
+    if let Some(ref mut stderr_rx) = env.stderr_rx {
+        read_pipe(stderr_rx, inner_buffer)
     } else {
-        update_last_error("could not find a file handle for `stderr`");
+        update_last_error("stderr is not captured; call wasi_config_capture_stderr first");
         -1
     }
 }
 
-fn read_inner(
-    wasi_file: &mut Box<dyn VirtualFile + Send + Sync + 'static>,
-    inner_buffer: &mut [u8],
-) -> isize {
-    block_on(async {
-        match wasi_file.read(inner_buffer).await {
-            Ok(a) => a as isize,
-            Err(err) => {
-                update_last_error(format!("failed to read wasi_file: {err}"));
-                -1
-            }
+fn read_pipe(pipe: &mut Pipe, buf: &mut [u8]) -> isize {
+    match pipe.try_read(buf) {
+        Some(n) => n as isize,
+        None => 0, // No data available yet
+    }
+}
+
+fn write_pipe(pipe: &mut Pipe, buf: &[u8]) -> isize {
+    match std::io::Write::write(pipe, buf) {
+        Ok(n) => n as isize,
+        Err(err) => {
+            update_last_error(format!("failed to write pipe: {err}"));
+            -1
         }
-    })
+    }
+}
+
+/// Write data to the captured stdin pipe.
+///
+/// Returns the number of bytes written, or -1 on error (e.g., stdin was not
+/// captured). Data can be written before or during WASM module execution.
+/// Call `wasi_env_close_stdin` after the last write so the module sees EOF.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wasi_env_write_stdin(
+    env: &mut wasi_env_t,
+    buffer: *const c_char,
+    buffer_len: usize,
+) -> isize {
+    let inner_buffer = unsafe { slice::from_raw_parts(buffer as *const _, buffer_len) };
+
+    if let Some(ref mut stdin_tx) = env.stdin_tx {
+        write_pipe(stdin_tx, inner_buffer)
+    } else {
+        update_last_error("stdin is not captured; call wasi_config_capture_stdin first");
+        -1
+    }
+}
+
+/// Close the stdin pipe so the module sees EOF.
+///
+/// Call this after writing all data via `wasi_env_write_stdin`. Without
+/// closing, modules that read until EOF (e.g., jq) will hang.
+/// Calling this multiple times is safe (subsequent calls are no-ops).
+#[unsafe(no_mangle)]
+pub extern "C" fn wasi_env_close_stdin(env: &mut wasi_env_t) {
+    if let Some(ref mut stdin_tx) = env.stdin_tx {
+        stdin_tx.close();
+    } else {
+        update_last_error("stdin is not captured; call wasi_config_capture_stdin first");
+    }
 }
 
 /// The version of WASI. This is determined by the imports namespace
@@ -752,6 +813,111 @@ mod tests {
                 wasm_byte_vec_delete(&wasm);
                 wasm_byte_vec_delete(&wat);
                 wasmer_funcenv_delete(env);
+                wasm_store_delete(store);
+                wasm_engine_delete(engine);
+
+                return 0;
+            }
+        })
+        .success();
+    }
+
+    #[allow(
+        unexpected_cfgs,
+        reason = "tools like cargo-llvm-coverage pass --cfg coverage"
+    )]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[test]
+    fn test_wasi_capture_stdout() {
+        (assert_c! {
+            #include "tests/wasmer.h"
+            #include <string.h>
+
+            int main() {
+                // The WAT module writes "hello world" to stdout via fd_write (wasi_unstable)
+                const char* wat =
+                    "(module"
+                    "  (import \"wasi_unstable\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))"
+                    "  (memory 1)"
+                    "  (export \"memory\" (memory 0))"
+                    "  (data (i32.const 8) \"hello world\")"
+                    "  (func $main (export \"_start\")"
+                    "    (i32.store (i32.const 0) (i32.const 8))"
+                    "    (i32.store (i32.const 4) (i32.const 11))"
+                    "    (call $fd_write"
+                    "      (i32.const 1)"
+                    "      (i32.const 0)"
+                    "      (i32.const 1)"
+                    "      (i32.const 20)"
+                    "    )"
+                    "    drop"
+                    "  )"
+                    ")";
+
+                wasm_engine_t* engine = wasm_engine_new();
+                wasm_store_t* store = wasm_store_new(engine);
+
+                // Compile module from WAT
+                wasm_byte_vec_t wat_vec;
+                wasmer_byte_vec_new_from_string(&wat_vec, wat);
+                wasm_byte_vec_t wasm;
+                wat2wasm(&wat_vec, &wasm);
+                assert(wasm.size > 0);
+
+                wasm_module_t* module = wasm_module_new(store, &wasm);
+                assert(module);
+                wasm_byte_vec_delete(&wasm);
+                wasm_byte_vec_delete(&wat_vec);
+
+                // Configure WASI with captured stdout
+                wasi_config_t* config = wasi_config_new("test_program");
+                assert(config);
+                wasi_config_capture_stdout(config);
+
+                wasi_env_t* wasi_env = wasi_env_new(store, config);
+                assert(wasi_env);
+
+                // Get WASI imports
+                wasm_extern_vec_t imports;
+                assert(wasi_get_imports(store, wasi_env, module, &imports));
+
+                // Instantiate
+                wasm_instance_t* instance = wasm_instance_new(store, module, &imports, NULL);
+                assert(instance);
+                assert(wasi_env_initialize_instance(wasi_env, store, instance));
+
+                // Get and call _start
+                wasm_func_t* start_func = wasi_get_start_function(instance);
+                assert(start_func);
+
+                wasm_val_vec_t args = WASM_EMPTY_VEC;
+                wasm_val_vec_t results = WASM_EMPTY_VEC;
+                wasm_trap_t* trap = wasm_func_call(start_func, &args, &results);
+                assert(!trap);
+
+                // Read captured stdout
+                char buffer[128] = {0};
+                intptr_t bytes_read = wasi_env_read_stdout(wasi_env, buffer, sizeof(buffer));
+                assert(bytes_read == 11);
+                assert(memcmp(buffer, "hello world", 11) == 0);
+
+                // Verify that reading without capture returns -1
+                wasi_config_t* config2 = wasi_config_new("test_program");
+                assert(config2);
+                // Do NOT call wasi_config_capture_stdout
+                wasi_env_t* wasi_env2 = wasi_env_new(store, config2);
+                assert(wasi_env2);
+                char buffer2[16];
+                assert(wasi_env_read_stdout(wasi_env2, buffer2, sizeof(buffer2)) == -1);
+                assert(wasi_env_read_stderr(wasi_env2, buffer2, sizeof(buffer2)) == -1);
+                wasi_env_delete(wasi_env2);
+
+                // Cleanup
+                wasm_func_delete(start_func);
+                wasm_extern_vec_delete(&imports);
+                wasm_instance_delete(instance);
+                wasi_env_delete(wasi_env);
+                wasm_module_delete(module);
                 wasm_store_delete(store);
                 wasm_engine_delete(engine);
 

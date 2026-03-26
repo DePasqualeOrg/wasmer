@@ -49,7 +49,20 @@ impl Mmap {
         }
     }
 
-    /// Create a new `Mmap` pointing to at least `size` bytes of page-aligned accessible memory.
+    /// Create a new `Mmap` pointing to at least `size` bytes of page-aligned accessible memory,
+    /// suitable for holding executable code.
+    ///
+    /// On Apple aarch64 (iOS and macOS Hardened Runtime), the allocation
+    /// includes `MAP_JIT` so pages can later be toggled between writable and
+    /// executable via `pthread_jit_write_protect_np`.
+    #[cfg(not(target_os = "windows"))]
+    pub fn with_at_least(size: usize) -> Result<Self, String> {
+        let page_size = region::page::size();
+        let rounded_size = size.next_multiple_of(page_size);
+        Self::accessible_reserved_inner(rounded_size, rounded_size, None, MmapType::Private, true)
+    }
+
+    #[cfg(target_os = "windows")]
     pub fn with_at_least(size: usize) -> Result<Self, String> {
         let page_size = region::page::size();
         let rounded_size = size.next_multiple_of(page_size);
@@ -61,10 +74,27 @@ impl Mmap {
     /// must be native page-size multiples.
     #[cfg(not(target_os = "windows"))]
     pub fn accessible_reserved(
+        accessible_size: usize,
+        mapping_size: usize,
+        backing_file: Option<std::path::PathBuf>,
+        memory_type: MmapType,
+    ) -> Result<Self, String> {
+        Self::accessible_reserved_inner(
+            accessible_size,
+            mapping_size,
+            backing_file,
+            memory_type,
+            false,
+        )
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn accessible_reserved_inner(
         mut accessible_size: usize,
         mapping_size: usize,
         mut backing_file: Option<std::path::PathBuf>,
         memory_type: MmapType,
+        for_code: bool,
     ) -> Result<Self, String> {
         use std::os::fd::IntoRawFd;
 
@@ -72,6 +102,17 @@ impl Mmap {
         assert_le!(accessible_size, mapping_size);
         assert_eq!(mapping_size & (page_size - 1), 0);
         assert_eq!(accessible_size & (page_size - 1), 0);
+
+        // MAP_JIT code pages must be fully accessible at allocation time,
+        // since the reserve-then-mprotect pattern doesn't work with MAP_JIT
+        // on iOS / macOS Hardened Runtime.
+        #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+        if for_code {
+            assert_eq!(
+                accessible_size, mapping_size,
+                "MAP_JIT code pages cannot be partially reserved"
+            );
+        }
 
         // Mmap may return EINVAL if the size is zero, so just
         // special-case that.
@@ -123,6 +164,16 @@ impl Mmap {
             MmapType::Private => libc::MAP_PRIVATE,
             MmapType::Shared => libc::MAP_SHARED,
         };
+
+        // On Apple aarch64, code pages need MAP_JIT so they can be toggled
+        // between writable and executable via pthread_jit_write_protect_np.
+        // Required for iOS and macOS Hardened Runtime.
+        #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+        if for_code && crate::apple_jit::is_supported() {
+            flags |= libc::MAP_JIT;
+        }
+        #[cfg(not(all(target_vendor = "apple", target_arch = "aarch64")))]
+        let _ = for_code;
 
         Ok(if accessible_size == mapping_size {
             // Allocate a single read-write region at once.

@@ -14,6 +14,9 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+/// MAP_JIT support for JIT code execution on Apple aarch64.
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+pub mod apple_jit;
 mod exception;
 mod export;
 mod extern_ref;

@@ -102,6 +102,13 @@ impl CodeMemory {
 
         self.mmap = Mmap::with_at_least(total_len)?;
 
+        // On Apple aarch64 with MAP_JIT, ensure the current thread is in
+        // write mode before copying code into the pages. This is necessary
+        // because the thread may still be in execute mode from a prior
+        // publish() call — the per-thread toggle applies to all MAP_JIT pages.
+        #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+        wasmer_vm::apple_jit::enable_write();
+
         // 3. Determine where the pointers to each function, executable section
         // or data section are. Copy the functions. Collect the addresses of each and return them.
 
@@ -163,6 +170,30 @@ impl CodeMemory {
             return;
         }
         assert!(self.mmap.len() >= self.start_of_nonexecutable_pages);
+
+        // On Apple aarch64 with MAP_JIT, toggle to execute mode and flush
+        // the instruction cache. On other platforms (or when MAP_JIT is not
+        // needed), use mprotect to make the code pages executable.
+        #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+        if wasmer_vm::apple_jit::is_supported() {
+            unsafe {
+                wasmer_vm::apple_jit::enable_execute(
+                    self.mmap.as_mut_ptr(),
+                    self.start_of_nonexecutable_pages,
+                );
+            }
+        } else {
+            unsafe {
+                region::protect(
+                    self.mmap.as_mut_ptr(),
+                    self.start_of_nonexecutable_pages,
+                    region::Protection::READ_EXECUTE,
+                )
+            }
+            .expect("unable to make memory readonly and executable");
+        }
+
+        #[cfg(not(all(target_vendor = "apple", target_arch = "aarch64")))]
         unsafe {
             region::protect(
                 self.mmap.as_mut_ptr(),

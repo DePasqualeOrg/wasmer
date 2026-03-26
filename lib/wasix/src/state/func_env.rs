@@ -169,10 +169,7 @@ impl WasiFunctionEnv {
             store,
             instance.clone(),
             WasiModuleTreeHandles::Static(WasiModuleInstanceHandles::new(
-                memory,
-                store,
-                instance,
-                None,
+                memory, store, instance, None,
             )),
             None,
             true,
@@ -358,11 +355,18 @@ impl WasiFunctionEnv {
             self.data(store).tid()
         );
 
-        if let Some(linker) = self.data(store).inner().linker().cloned() {
-            // Note: this call will also process pending dl operations, hence unblocking
-            // other threads that may be waiting for this one to pick the operation up
-            if let Err(e) = linker.shutdown_instance_group(&mut self.env.clone().into_mut(store)) {
-                tracing::warn!("Failed to shutdown linker instance group: {e:?}");
+        // Guard against on_exit being called before the instance was fully
+        // initialized (e.g., wasm_instance_new failed and wasi_env_delete
+        // runs cleanup). try_inner() returns None if set_inner was never called.
+        if let Some(inner) = self.data(store).try_inner() {
+            if let Some(linker) = inner.linker().cloned() {
+                // Note: this call will also process pending dl operations, hence unblocking
+                // other threads that may be waiting for this one to pick the operation up
+                if let Err(e) =
+                    linker.shutdown_instance_group(&mut self.env.clone().into_mut(store))
+                {
+                    tracing::warn!("Failed to shutdown linker instance group: {e:?}");
+                }
             }
         }
 

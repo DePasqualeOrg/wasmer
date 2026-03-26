@@ -219,7 +219,31 @@ impl BaseTunables {
                 // Static Memory Guard size:
                 //   Allocating 2 GiB of address space lets us translate wasm
                 //   offsets into x86 offsets as aggressively as we can.
-                PointerWidth::U64 => (0x1_0000.into(), 0x8000_0000),
+                //
+                // Apple embedded platforms (iOS, watchOS, tvOS, visionOS) have
+                // much stricter virtual memory limits (~2-4 GiB total) than
+                // macOS, so we use reduced tunables to avoid ENOMEM from mmap.
+                // This is checked against the target triple (not #[cfg]) so that
+                // cross-compilation (e.g., wasmer create-obj --target aarch64-apple-ios
+                // running on macOS) also uses the reduced tunables.
+                PointerWidth::U64 => {
+                    use target_lexicon::OperatingSystem;
+                    let is_embedded_apple = matches!(
+                        triple.operating_system,
+                        OperatingSystem::IOS(_)
+                            | OperatingSystem::WatchOS(_)
+                            | OperatingSystem::TvOS(_)
+                            | OperatingSystem::VisionOS(_)
+                            | OperatingSystem::XROS(_)
+                    );
+                    if is_embedded_apple {
+                        // 16,384 pages (1 GiB) static bound, 64 KiB guard
+                        (0x4000.into(), 0x1_0000)
+                    } else {
+                        // 65,536 pages (4 GiB) static bound, 2 GiB guard
+                        (0x1_0000.into(), 0x8000_0000)
+                    }
+                }
             };
 
         // Allocate a small guard to optimize common cases but without

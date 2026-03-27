@@ -24,6 +24,7 @@ use wasmer_wasix::{
     default_fs_backing, get_wasi_version,
     runtime::task_manager::{tokio::TokioTaskManager, block_on},
 };
+use wasmer_types::ModuleHash;
 use std::path::PathBuf;
 use wasmer_wasix::virtual_fs::FileSystem as _;
 
@@ -752,6 +753,84 @@ pub unsafe extern "C" fn wasi_env_get_exit_code(
         }
         None => -1,
     }
+}
+
+/// Save a compiled module to the runtime's module cache under the given hash.
+fn save_module_to_cache(
+    wasi_env: &wasi_env_t,
+    hash: ModuleHash,
+    module: &wasm_module_t,
+) -> bool {
+    let store = unsafe { wasi_env.store.store() };
+    let env = wasi_env.inner.env.as_ref(&store);
+    let runtime = env.runtime.clone();
+    let module_cache = runtime.module_cache();
+    let engine = runtime.engine();
+    // Release the store borrow before blocking
+    drop(store);
+
+    let _guard = wasi_env.runtime_handle.as_ref().map(|h| h.enter());
+
+    match block_on(module_cache.save(hash, &engine, &module.inner)) {
+        Ok(()) => true,
+        Err(e) => {
+            update_last_error(format!("Failed to cache module: {e}"));
+            false
+        }
+    }
+}
+
+/// Pre-populate the module cache with a compiled module so that
+/// BinFactory finds it during `proc_exec` instead of JIT-compiling.
+///
+/// `wasm_bytes` / `wasm_len` are the raw `.wasm` bytes of the tool.
+/// `module` is an already-compiled module (e.g., from `wasm_module_deserialize`
+/// with a pre-compiled static artifact).
+///
+/// The module is stored in the runtime's module cache under the SHA-256
+/// hash of `wasm_bytes`. When WASIX bash runs `proc_exec` to invoke an
+/// external command, BinFactory hashes the `.wasm` file it finds on the
+/// guest filesystem, checks the cache, and — if there is a hit — uses the
+/// cached module instead of calling `Module::new()` (which requires JIT).
+///
+/// Call this after `wasi_env_new` and before `wasi_start`, once per tool
+/// that should be available to bash without JIT compilation.
+///
+/// Returns `true` on success, `false` on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wasi_env_cache_module(
+    wasi_env: &wasi_env_t,
+    wasm_bytes: *const u8,
+    wasm_len: usize,
+    module: &wasm_module_t,
+) -> bool {
+    debug_assert!(!wasm_bytes.is_null());
+    let bytes = unsafe { slice::from_raw_parts(wasm_bytes, wasm_len) };
+    let hash = ModuleHash::new(bytes);
+    save_module_to_cache(wasi_env, hash, module)
+}
+
+/// Pre-populate the WASI module cache using a pre-computed SHA-256 hash.
+///
+/// Like `wasi_env_cache_module`, but accepts the 32-byte hash directly
+/// instead of computing it from raw `.wasm` bytes. This allows caching
+/// pre-compiled static modules without needing the original `.wasm` files
+/// at runtime — the hash is embedded at build time.
+///
+/// `hash` must point to exactly 32 bytes (SHA-256 digest).
+///
+/// Returns `true` on success, `false` on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wasi_env_cache_module_with_hash(
+    wasi_env: &wasi_env_t,
+    hash: *const u8,
+    module: &wasm_module_t,
+) -> bool {
+    debug_assert!(!hash.is_null());
+    let hash_bytes: [u8; 32] = unsafe { slice::from_raw_parts(hash, 32) }
+        .try_into()
+        .expect("hash must be 32 bytes");
+    save_module_to_cache(wasi_env, ModuleHash::from_bytes(hash_bytes), module)
 }
 
 /// The version of WASI. This is determined by the imports namespace

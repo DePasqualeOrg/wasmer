@@ -434,7 +434,7 @@ impl WasiEnv {
 
     // FIXME: use custom error type
     #[allow(clippy::result_large_err)]
-    pub(crate) fn instantiate(
+    pub fn instantiate(
         self,
         module: Module,
         store: &mut impl AsStoreMut,

@@ -7055,6 +7055,7 @@ dependencies = [
  "wasmer-compiler-singlepass",
  "wasmer-inline-c",
  "wasmer-middlewares",
+ "wasmer-package",
  "wasmer-types",
  "wasmer-wasix",
  "webc",

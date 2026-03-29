@@ -38,8 +38,10 @@ wasmer-wasix = { path = "../wasix", version = "=0.701.0", features = [
 	"sys",
 ], default-features = false, optional = true }
 webc = { workspace = true, optional = true }
+wasmer-package = { workspace = true, optional = true }
 virtual-fs = { version = "0.701.0", path = "../virtual-fs", optional = true, default-features = false, features = [
 	"static-fs",
+	"webc-fs",
 ] }
 enumset.workspace = true
 cfg-if.workspace = true
@@ -142,7 +144,7 @@ wasmer-artifact-load = ["wasmer-compiler/wasmer-artifact-load"]
 wasmer-artifact-create = ["wasmer-compiler/wasmer-artifact-create"]
 static-artifact-load = ["wasmer-compiler/static-artifact-load"]
 static-artifact-create = ["wasmer-compiler/static-artifact-create"]
-webc_runner = ["virtual-fs", "webc"]
+webc_runner = ["virtual-fs", "webc", "wasmer-package"]
 # Deprecated features.
 jit = ["compiler"]
 

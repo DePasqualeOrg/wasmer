@@ -213,8 +213,66 @@ pub unsafe extern "C" fn wasi_filesystem_init_static_memory(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasi_filesystem_delete(_ptr: Option<Box<wasi_filesystem_t>>) {}
 
+/// Extract the raw wasm module bytes for a named atom from a .webc package.
+///
+/// The `wasi_filesystem_t` must have been created from .webc package bytes via
+/// `wasi_filesystem_init_static_memory`. The `atom_name` identifies which module
+/// to extract (e.g., "python" for the python/python package).
+///
+/// On success, `out_bytes` is populated with the wasm module bytes and the
+/// function returns `true`. The caller owns the resulting `wasm_byte_vec_t`
+/// and must free it with `wasm_byte_vec_delete`. Returns `false` if the atom
+/// cannot be found or the .webc bytes are invalid.
+#[cfg(feature = "webc_runner")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wasi_filesystem_get_atom(
+    fs: Option<&wasi_filesystem_t>,
+    atom_name: *const c_char,
+    out_bytes: Option<&mut wasm_byte_vec_t>,
+) -> bool {
+    let fs = match fs {
+        Some(fs) => fs,
+        None => return false,
+    };
+    let out_bytes = match out_bytes {
+        Some(out) => out,
+        None => return false,
+    };
+    if atom_name.is_null() {
+        return false;
+    }
+    let atom_name = match unsafe { CStr::from_ptr(atom_name) }.to_str() {
+        Ok(name) => name,
+        Err(_) => return false,
+    };
+
+    let slice = unsafe { std::slice::from_raw_parts(fs.ptr as *const u8, fs.size) };
+
+    // Use wasmer_package which handles all .webc versions (v1, v2, v3)
+    let container = match wasmer_package::utils::from_bytes(slice.to_vec()) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let atoms = container.atoms();
+    let atom_bytes = match atoms.get(atom_name) {
+        Some(bytes) => bytes,
+        None => return false,
+    };
+
+    out_bytes.set_buffer(atom_bytes.to_vec());
+    true
+}
+
 /// Initializes the `imports` with an import object that links to
-/// the custom file system
+/// the custom file system.
+///
+/// Note: The `package` parameter is no longer used (volumes are now
+/// parsed directly from the .webc bytes) but is retained for ABI
+/// compatibility.
+///
+/// For modules that use WASIX dynamic linking (e.g., Python), use
+/// `wasi_env_instantiate_webc` instead — it handles the full linker.
 #[cfg(feature = "webc_runner")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasi_env_with_filesystem(
@@ -228,6 +286,143 @@ pub unsafe extern "C" fn wasi_env_with_filesystem(
     unsafe { wasi_env_with_filesystem_inner(config, store, module, fs, imports, package) }
 }
 
+/// Create a WASI environment from a .webc package and instantiate the module,
+/// handling WASIX dynamic linking automatically.
+///
+/// This combines filesystem setup, environment creation, and module instantiation
+/// into a single call. It uses `WasiEnv::instantiate()` internally, which handles
+/// dynamically-linked WASIX modules (e.g., Python) that require the full linker.
+///
+/// On success, the instance is returned and `wasi_env_out` is populated with the
+/// WASI environment (caller must free both with the appropriate delete functions).
+/// After this call, use `wasi_env_write_stdin` / `wasi_env_close_stdin` for stdin,
+/// `wasi_start` for execution, and `wasi_env_read_stdout` / `wasi_env_read_stderr`
+/// for output.
+#[cfg(feature = "webc_runner")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wasi_env_instantiate_webc(
+    config: Box<wasi_config_t>,
+    store: Option<&mut wasm_store_t>,
+    module: Option<&wasm_module_t>,
+    fs: Option<&wasi_filesystem_t>,
+    wasi_env_out: *mut *mut wasi_env_t,
+) -> Option<Box<wasm_instance_t>> {
+    unsafe { wasi_env_instantiate_webc_inner(config, store, module, fs, wasi_env_out) }
+}
+
+#[cfg(feature = "webc_runner")]
+unsafe fn wasi_env_instantiate_webc_inner(
+    mut config: Box<wasi_config_t>,
+    store: Option<&mut wasm_store_t>,
+    module: Option<&wasm_module_t>,
+    fs: Option<&wasi_filesystem_t>,
+    wasi_env_out: *mut *mut wasi_env_t,
+) -> Option<Box<wasm_instance_t>> {
+    let store = &mut store?.inner;
+    let fs = fs.as_ref()?;
+    let module = &module.as_ref()?.inner;
+
+    if wasi_env_out.is_null() {
+        return None;
+    }
+    // Initialize to null so callers see NULL on any early return
+    unsafe { *wasi_env_out = std::ptr::null_mut() };
+
+    let slice = unsafe { std::slice::from_raw_parts(fs.ptr as *const u8, fs.size) };
+
+    let (filesystem, top_level_dirs) = mount_webc_filesystem(slice)?;
+
+    // Set up tokio runtime
+    let runtime = config.runtime.take().unwrap_or_else(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    });
+    let handle = runtime.handle().clone();
+    let _guard = handle.enter();
+
+    let mut store_mut = unsafe { store.store_mut() };
+    let mut rt = PluggableRuntime::new(Arc::new(TokioTaskManager::new(runtime)));
+    rt.set_engine(store_mut.engine().clone());
+
+    // Configure the builder
+    let mut builder = config.builder.runtime(Arc::new(rt));
+    builder.set_fs(filesystem);
+
+    for f_name in top_level_dirs.iter() {
+        builder
+            .add_preopen_build(|p| p.directory(f_name).read(true).write(true).create(true))
+            .ok()?;
+    }
+
+    // Set up stdio pipes
+    let mut stdout_rx = None;
+    if !config.inherit_stdout {
+        let (stdout_tx, rx) = Pipe::channel();
+        builder.set_stdout(Box::new(stdout_tx));
+        stdout_rx = Some(rx);
+    }
+
+    let mut stderr_rx = None;
+    if !config.inherit_stderr {
+        let (stderr_tx, rx) = Pipe::channel();
+        builder.set_stderr(Box::new(stderr_tx));
+        stderr_rx = Some(rx);
+    }
+
+    let mut stdin_tx = None;
+    if !config.inherit_stdin {
+        let (tx, stdin_rx) = Pipe::channel();
+        builder.set_stdin(Box::new(stdin_rx));
+        stdin_tx = Some(tx);
+    }
+
+    // Build the WasiEnv (not finalize — we need WasiEnv for instantiate())
+    let wasi_env = match builder.build() {
+        Ok(env) => env,
+        Err(e) => {
+            update_last_error(format!("Failed to build WASI environment: {e}"));
+            return None;
+        }
+    };
+
+    // Instantiate with full WASIX support (handles dynamic linking)
+    let (instance, func_env) = match wasi_env.instantiate(
+        module.clone(),
+        &mut store_mut,
+        None,   // memory (let the linker handle it)
+        true,   // update_layout
+        true,   // call_initialize
+        None,   // parent_linker_and_ctx
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            update_last_error(format!("Failed to instantiate module: {e}"));
+            return None;
+        }
+    };
+
+    // Wrap the results
+    let env = Box::new(wasi_env_t {
+        inner: func_env,
+        store: store.clone(),
+        stdout_rx,
+        stderr_rx,
+        stdin_tx,
+        imported_memory: None,
+        runtime_handle: Some(handle),
+        extra_imports: Vec::new(),
+    });
+
+    unsafe { *wasi_env_out = Box::into_raw(env) };
+
+    Some(Box::new(wasm_instance_t {
+        inner: instance,
+        store: store.clone(),
+    }))
+}
+
 #[cfg(feature = "webc_runner")]
 unsafe fn wasi_env_with_filesystem_inner(
     config: Box<wasi_config_t>,
@@ -235,16 +430,14 @@ unsafe fn wasi_env_with_filesystem_inner(
     module: Option<&wasm_module_t>,
     fs: Option<&wasi_filesystem_t>,
     imports: Option<&mut wasm_extern_vec_t>,
-    package: *const c_char,
+    _package: *const c_char,
 ) -> Option<Box<wasi_env_t>> {
     let store = &mut store?.inner;
     let fs = fs.as_ref()?;
-    let package_str = unsafe { CStr::from_ptr(package) };
-    let package = package_str.to_str().unwrap_or("");
     let module = &module.as_ref()?.inner;
     let imports = imports?;
-    #[allow(clippy::unnecessary_cast)]
-    let fs_bytes = unsafe { &*(fs.ptr as *const u8) };
+
+    let slice = unsafe { std::slice::from_raw_parts(fs.ptr as *const u8, fs.size) };
 
     let (wasi_env, import_object, stdout_rx, stderr_rx, stdin_tx) = {
         let mut store_mut = unsafe { store.store_mut() };
@@ -252,13 +445,15 @@ unsafe fn wasi_env_with_filesystem_inner(
             config,
             &mut store_mut,
             module,
-            fs_bytes, // cast wasi_filesystem_t.ptr as &'static [u8]
-            fs.size,
-            package,
+            slice,
         )?
     };
 
-    imports_set_buffer(store, module, import_object, imports)?;
+    // Resolve imports, creating trap stubs for any that are missing.
+    // WASIX modules (like Python) may import C++ runtime symbols (e.g.,
+    // env._ZTH5errno) that are normally resolved by the dynamic linker.
+    // Since we're not using the full linker, we provide trap stubs instead.
+    imports_set_buffer_with_stubs(store, module, import_object, imports)?;
 
     Some(Box::new(wasi_env_t {
         inner: wasi_env,
@@ -267,11 +462,53 @@ unsafe fn wasi_env_with_filesystem_inner(
         stderr_rx,
         stdin_tx,
         imported_memory: None,
-        // TODO: pass the tokio runtime handle from prepare_webc_env so that
-        // wasi_start can enter the runtime for this code path too
         runtime_handle: None,
         extra_imports: Vec::new(),
     }))
+}
+
+/// Parse a .webc package and mount its volumes according to the manifest's [fs] mappings.
+/// Returns the filesystem and the list of top-level directories to preopen.
+/// Supports .webc v1, v2, and v3.
+#[cfg(feature = "webc_runner")]
+fn mount_webc_filesystem(
+    webc_bytes: &[u8],
+) -> Option<(Arc<dyn wasmer_wasix::virtual_fs::FileSystem + Send + Sync>, Vec<String>)> {
+    use virtual_fs::webc_volume_fs::WebcVolumeFileSystem;
+    use wasmer_wasix::virtual_fs::FileSystem;
+
+    // from_bytes requires an owned Vec (it may need to store a reference).
+    let container = wasmer_package::utils::from_bytes(webc_bytes.to_vec()).ok()?;
+
+    let volumes = container.volumes();
+    let union_fs = virtual_fs::union_fs::UnionFileSystem::new();
+    let mut top_level_dirs: Vec<String> = Vec::new();
+
+    if let Ok(Some(webc::metadata::annotations::FileSystemMappings(mappings))) =
+        container.manifest().filesystem()
+    {
+        for mapping in &mappings {
+            if let Some(volume) = volumes.get(&mapping.volume_name) {
+                let webc_vol = WebcVolumeFileSystem::new(volume.clone());
+                let _ = union_fs.mount(
+                    mapping.volume_name.clone(),
+                    std::path::Path::new(&mapping.mount_path),
+                    Box::new(webc_vol),
+                );
+                top_level_dirs.push(mapping.mount_path.clone());
+            }
+        }
+    } else {
+        // Fallback: mount all volumes at root (v2 compat)
+        for (name, volume) in &volumes {
+            let webc_vol = WebcVolumeFileSystem::new(volume.clone());
+            let _ = union_fs.mount(name.clone(), std::path::Path::new("/"), Box::new(webc_vol));
+        }
+        top_level_dirs.push("/".to_string());
+    }
+
+    let filesystem = Arc::new(union_fs) as Arc<dyn FileSystem + Send + Sync>;
+    Some((filesystem, top_level_dirs))
 }
 
 #[cfg(feature = "webc_runner")]
@@ -279,14 +516,8 @@ fn prepare_webc_env(
     mut config: Box<wasi_config_t>,
     store: &mut impl AsStoreMut,
     module: &Module,
-    bytes: &'static u8,
-    len: usize,
-    package_name: &str,
+    webc_bytes: &[u8],
 ) -> Option<(WasiFunctionEnv, Imports, Option<Pipe>, Option<Pipe>, Option<Pipe>)> {
-    use virtual_fs::static_fs::StaticFileSystem;
-    use wasmer_wasix::virtual_fs::FileSystem;
-    use webc::v1::{FsEntryType, WebC};
-
     let store_mut = store.as_store_mut();
     let runtime = config.runtime.take();
 
@@ -302,24 +533,8 @@ fn prepare_webc_env(
     let mut rt = PluggableRuntime::new(Arc::new(TokioTaskManager::new(runtime)));
     rt.set_engine(store_mut.engine().clone());
 
-    let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
-    let volumes = WebC::parse_volumes_from_fileblock(slice).ok()?;
-    let top_level_dirs = volumes
-        .into_iter()
-        .flat_map(|(_, volume)| {
-            volume
-                .header
-                .top_level
-                .iter()
-                .filter(|entry| entry.fs_type == FsEntryType::Dir)
-                .map(|e| e.text.to_string())
-                .collect::<Vec<_>>()
-                .into_iter()
-        })
-        .collect::<Vec<_>>();
+    let (filesystem, top_level_dirs) = mount_webc_filesystem(webc_bytes)?;
 
-    let filesystem =
-        Arc::new(StaticFileSystem::init(slice, package_name)?) as Arc<dyn FileSystem + Send + Sync>;
     let mut builder = config.builder.runtime(Arc::new(rt));
 
     let mut stdout_rx = None;
@@ -1003,6 +1218,43 @@ unsafe fn wasi_get_imports_inner(
     imports_set_buffer(store, &module.inner, import_object, imports)?;
 
     Some(())
+}
+
+/// Like `imports_set_buffer`, but generates trap stubs for any unresolved
+/// *function* imports. This is needed for .webc packages where WASIX modules
+/// import C++ runtime symbols that are normally resolved by the dynamic linker
+/// (e.g., `env._ZTH5errno`). Non-function imports (memory, global, table)
+/// cannot be meaningfully stubbed and will still fail if unresolved.
+#[cfg(feature = "webc_runner")]
+fn imports_set_buffer_with_stubs(
+    store: &mut StoreRef,
+    module: &wasmer_api::Module,
+    mut import_object: wasmer_api::Imports,
+    imports: &mut wasm_extern_vec_t,
+) -> Option<()> {
+    // First pass: create stub functions for any unresolved function imports
+    {
+        let mut store_mut = unsafe { store.store_mut() };
+        for import_type in module.imports() {
+            if import_object.get_export(import_type.module(), import_type.name()).is_some() {
+                continue;
+            }
+            if let wasmer_api::ExternType::Function(func_ty) = import_type.ty() {
+                let module_name = import_type.module().to_string();
+                let import_name = import_type.name().to_string();
+                let func = wasmer_api::Function::new(&mut store_mut, &*func_ty, move |_args| {
+                    Err(wasmer_api::RuntimeError::new(format!(
+                        "called unresolved import {}.{}",
+                        module_name, import_name
+                    )))
+                });
+                import_object.define(import_type.module(), import_type.name(), func);
+            }
+        }
+    }
+
+    // Second pass: resolve all imports (should now succeed)
+    imports_set_buffer(store, module, import_object, imports)
 }
 
 pub(crate) fn imports_set_buffer(

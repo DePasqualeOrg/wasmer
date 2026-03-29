@@ -302,9 +302,7 @@ impl CompilerConfig for Cranelift {
 
     fn supported_features_for_target(&self, target: &Target) -> wasmer_types::Features {
         let mut feats = Features::default();
-        if target.triple().operating_system == OperatingSystem::Linux {
-            feats.exceptions(true);
-        }
+        feats.exceptions(true);
         feats.relaxed_simd(true);
         feats.wide_arithmetic(true);
         feats

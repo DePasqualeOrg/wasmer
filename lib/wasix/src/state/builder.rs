@@ -902,7 +902,10 @@ impl WasiEnvBuilder {
             }
         }
 
-        // Determine the STDIN
+        // Determine which stdio fds are overridden (piped) vs inherited (terminal)
+        let stdin_overridden = self.stdin.is_some();
+        let stdout_overridden = self.stdout.is_some();
+        let stderr_overridden = self.stderr.is_some();
         let stdin: Box<dyn VirtualFile + Send + Sync + 'static> = self
             .stdin
             .take()
@@ -962,6 +965,21 @@ impl WasiEnvBuilder {
 
             if let Some(f) = &self.setup_fs_fn {
                 f(&inodes, &mut wasi_fs).map_err(WasiStateCreationError::WasiFsSetupError)?;
+            }
+            if stdin_overridden {
+                wasi_fs
+                    .stdin_is_piped
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            if stdout_overridden {
+                wasi_fs
+                    .stdout_is_piped
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            if stderr_overridden {
+                wasi_fs
+                    .stderr_is_piped
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
             wasi_fs
         };

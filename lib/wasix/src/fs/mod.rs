@@ -595,6 +595,15 @@ pub struct WasiFs {
     // It should not be necessary at all.
     is_wasix: AtomicBool,
 
+    /// When true, the corresponding stdio fd has been overridden (e.g., with
+    /// a captured pipe). fd_fdstat_get reports it as Unknown instead of
+    /// CharacterDevice, so isatty() returns false. Without this, tools that
+    /// check whether stdio is a terminal get incorrect results when stdio
+    /// is programmatically captured.
+    pub(crate) stdin_is_piped: AtomicBool,
+    pub(crate) stdout_is_piped: AtomicBool,
+    pub(crate) stderr_is_piped: AtomicBool,
+
     // The preopens when this was initialized
     pub(crate) init_preopens: Vec<PreopenedDir>,
     // The virtual file system preopens when this was initialized
@@ -678,6 +687,9 @@ impl WasiFs {
             fd_map: RwLock::new(self.fd_map.read().unwrap().clone()),
             current_dir: Mutex::new(self.current_dir.lock().unwrap().clone()),
             is_wasix: AtomicBool::new(self.is_wasix.load(Ordering::Acquire)),
+            stdin_is_piped: AtomicBool::new(self.stdin_is_piped.load(Ordering::Acquire)),
+            stdout_is_piped: AtomicBool::new(self.stdout_is_piped.load(Ordering::Acquire)),
+            stderr_is_piped: AtomicBool::new(self.stderr_is_piped.load(Ordering::Acquire)),
             root_fs: self.root_fs.clone(),
             root_inode: self.root_inode.clone(),
             has_unioned: Mutex::new(self.has_unioned.lock().unwrap().clone()),
@@ -830,6 +842,9 @@ impl WasiFs {
             fd_map: RwLock::new(FdList::new()),
             current_dir: Mutex::new("/".to_string()),
             is_wasix: AtomicBool::new(false),
+            stdin_is_piped: AtomicBool::new(false),
+            stdout_is_piped: AtomicBool::new(false),
+            stderr_is_piped: AtomicBool::new(false),
             root_fs: fs_backing,
             root_inode,
             has_unioned: Mutex::new(HashSet::new()),
@@ -1603,24 +1618,42 @@ impl WasiFs {
     pub fn fdstat(&self, fd: WasiFd) -> Result<Fdstat, Errno> {
         match fd {
             __WASI_STDIN_FILENO => {
+                // wasi-libc's isatty() returns true only for CharacterDevice,
+                // so any other type (including Unknown) makes isatty(0) return false.
+                // WASI has no Pipe variant in Filetype.
+                let filetype = if self.stdin_is_piped.load(Ordering::Relaxed) {
+                    Filetype::Unknown
+                } else {
+                    Filetype::CharacterDevice
+                };
                 return Ok(Fdstat {
-                    fs_filetype: Filetype::CharacterDevice,
+                    fs_filetype: filetype,
                     fs_flags: Fdflags::empty(),
                     fs_rights_base: STDIN_DEFAULT_RIGHTS,
                     fs_rights_inheriting: Rights::empty(),
                 });
             }
             __WASI_STDOUT_FILENO => {
+                let filetype = if self.stdout_is_piped.load(Ordering::Relaxed) {
+                    Filetype::Unknown
+                } else {
+                    Filetype::CharacterDevice
+                };
                 return Ok(Fdstat {
-                    fs_filetype: Filetype::CharacterDevice,
+                    fs_filetype: filetype,
                     fs_flags: Fdflags::APPEND,
                     fs_rights_base: STDOUT_DEFAULT_RIGHTS,
                     fs_rights_inheriting: Rights::empty(),
                 });
             }
             __WASI_STDERR_FILENO => {
+                let filetype = if self.stderr_is_piped.load(Ordering::Relaxed) {
+                    Filetype::Unknown
+                } else {
+                    Filetype::CharacterDevice
+                };
                 return Ok(Fdstat {
-                    fs_filetype: Filetype::CharacterDevice,
+                    fs_filetype: filetype,
                     fs_flags: Fdflags::APPEND,
                     fs_rights_base: STDERR_DEFAULT_RIGHTS,
                     fs_rights_inheriting: Rights::empty(),

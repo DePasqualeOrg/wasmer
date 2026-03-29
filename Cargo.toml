@@ -604,3 +604,6 @@ required-features = ["cranelift"]
 name = "throw-exception"
 path = "examples/throw_exception.rs"
 required-features = ["llvm"]
+
+[patch.crates-io]
+cranelift-codegen = { path = "patches/cranelift-codegen" }

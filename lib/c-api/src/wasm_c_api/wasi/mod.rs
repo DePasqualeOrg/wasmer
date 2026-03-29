@@ -270,6 +270,7 @@ unsafe fn wasi_env_with_filesystem_inner(
         // TODO: pass the tokio runtime handle from prepare_webc_env so that
         // wasi_start can enter the runtime for this code path too
         runtime_handle: None,
+        extra_imports: Vec::new(),
     }))
 }
 
@@ -372,6 +373,10 @@ pub struct wasi_env_t {
     /// WASIX modules that use proc_fork need the tokio runtime to be active
     /// on the calling thread so that child tasks can be properly scheduled.
     runtime_handle: Option<tokio::runtime::Handle>,
+    /// Custom host function imports to include alongside WASI imports.
+    /// Each entry is (module_name, import_name, extern). These are merged
+    /// into the import object when wasi_get_imports resolves imports.
+    extra_imports: Vec<(String, String, wasmer_api::Extern)>,
 }
 
 /// Create a new WASI environment.
@@ -507,7 +512,41 @@ pub unsafe extern "C" fn wasi_env_new(
         stdin_tx,
         imported_memory: None,
         runtime_handle: Some(handle),
+        extra_imports: Vec::new(),
     }))
+}
+
+/// Register a custom host function import on a [`wasi_env_t`].
+///
+/// When [`wasi_get_imports`] resolves imports for a module, any registered
+/// extra imports are included alongside the standard WASI imports. This
+/// allows modules with non-WASI imports (e.g., `env.exec_command`) to be
+/// instantiated through the normal WASI import resolution path.
+///
+/// `module_name` and `import_name` are null-terminated C strings.
+/// The function is cloned internally, so the caller retains ownership.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wasi_env_add_host_function(
+    wasi_env: Option<&mut wasi_env_t>,
+    module_name: *const c_char,
+    import_name: *const c_char,
+    func: Option<&wasm_func_t>,
+) -> bool {
+    let Some(wasi_env) = wasi_env else { return false };
+    let Some(func) = func else { return false };
+    if module_name.is_null() || import_name.is_null() {
+        return false;
+    }
+    let module_name = unsafe { CStr::from_ptr(module_name) }
+        .to_string_lossy()
+        .into_owned();
+    let import_name = unsafe { CStr::from_ptr(import_name) }
+        .to_string_lossy()
+        .into_owned();
+    wasi_env
+        .extra_imports
+        .push((module_name, import_name, func.extern_.inner.clone()));
+    true
 }
 
 /// Delete a [`wasi_env_t`].
@@ -954,6 +993,11 @@ unsafe fn wasi_get_imports_inner(
         import_object.define("env", "memory", memory.clone());
         // Store the memory for WASIX modules that import rather than export it
         wasi_env.imported_memory = Some(memory);
+    }
+
+    // Add any custom host function imports registered via wasi_env_add_host_function
+    for (module_name, import_name, ext) in &wasi_env.extra_imports {
+        import_object.define(module_name, import_name, ext.clone());
     }
 
     imports_set_buffer(store, &module.inner, import_object, imports)?;

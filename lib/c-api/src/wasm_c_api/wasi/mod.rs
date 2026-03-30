@@ -11,22 +11,65 @@ use super::{
     types::wasm_byte_vec_t,
 };
 use crate::error::update_last_error;
+use libc::ptrdiff_t;
 use std::convert::TryFrom;
 use std::ffi::CStr;
-use std::os::raw::c_char;
+use std::io;
+use std::os::raw::{c_char, c_void};
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::slice;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use wasmer_api::Memory;
 #[cfg(feature = "webc_runner")]
 use wasmer_api::{AsStoreMut, Imports, Module};
-use wasmer_api::Memory;
+use wasmer_types::ModuleHash;
+use wasmer_wasix::virtual_fs::FileSystem as _;
 use wasmer_wasix::{
     Pipe, PluggableRuntime, WasiEnv, WasiEnvBuilder, WasiFunctionEnv, WasiVersion,
     default_fs_backing, get_wasi_version,
-    runtime::task_manager::{tokio::TokioTaskManager, block_on},
+    runtime::task_manager::{block_on, tokio::TokioTaskManager},
 };
-use wasmer_types::ModuleHash;
-use std::path::PathBuf;
-use wasmer_wasix::virtual_fs::FileSystem as _;
+
+#[allow(non_camel_case_types)]
+type wasi_config_write_callback_t =
+    unsafe extern "C" fn(env: *mut c_void, bytes: *const u8, bytes_len: usize) -> ptrdiff_t;
+
+#[derive(Clone, Debug)]
+struct StdioWriteHandler {
+    callback: wasi_config_write_callback_t,
+    env: *mut c_void,
+    finalizer: Arc<Mutex<Option<unsafe extern "C" fn(env: *mut c_void)>>>,
+}
+
+unsafe impl Send for StdioWriteHandler {}
+unsafe impl Sync for StdioWriteHandler {}
+
+impl StdioWriteHandler {
+    fn new(
+        callback: wasi_config_write_callback_t,
+        env: *mut c_void,
+        finalizer: Option<unsafe extern "C" fn(env: *mut c_void)>,
+    ) -> Self {
+        Self {
+            callback,
+            env,
+            finalizer: Arc::new(Mutex::new(finalizer)),
+        }
+    }
+}
+
+impl Drop for StdioWriteHandler {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.finalizer.lock()
+            && Arc::strong_count(&self.finalizer) == 1
+            && let Some(finalizer) = guard.take()
+        {
+            unsafe { finalizer(self.env) };
+        }
+    }
+}
 
 #[derive(Debug)]
 #[allow(non_camel_case_types)]
@@ -34,6 +77,8 @@ pub struct wasi_config_t {
     inherit_stdout: bool,
     inherit_stderr: bool,
     inherit_stdin: bool,
+    stdout_custom: Option<StdioWriteHandler>,
+    stderr_custom: Option<StdioWriteHandler>,
     builder: WasiEnvBuilder,
     runtime: Option<tokio::runtime::Runtime>,
     /// Mapped directories: (guest_alias, host_path).
@@ -66,6 +111,8 @@ pub unsafe extern "C" fn wasi_config_new(
         inherit_stdout: true,
         inherit_stderr: true,
         inherit_stdin: true,
+        stdout_custom: None,
+        stderr_custom: None,
         builder: WasiEnv::builder(prog_name),
         runtime: Some(runtime),
         mapped_dirs: Vec::new(),
@@ -152,7 +199,9 @@ pub unsafe extern "C" fn wasi_config_mapdir(
 
     // Record the mapping for filesystem setup in wasi_env_new.
     // The alias is stored as-is; normalization happens during setup.
-    config.mapped_dirs.push((alias_str.to_string(), PathBuf::from(dir_str)));
+    config
+        .mapped_dirs
+        .push((alias_str.to_string(), PathBuf::from(dir_str)));
 
     true
 }
@@ -160,21 +209,47 @@ pub unsafe extern "C" fn wasi_config_mapdir(
 #[unsafe(no_mangle)]
 pub extern "C" fn wasi_config_capture_stdout(config: &mut wasi_config_t) {
     config.inherit_stdout = false;
+    config.stdout_custom = None;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wasi_config_set_stdout_custom(
+    config: &mut wasi_config_t,
+    callback: wasi_config_write_callback_t,
+    data: *mut c_void,
+    finalizer: Option<unsafe extern "C" fn(env: *mut c_void)>,
+) {
+    config.inherit_stdout = false;
+    config.stdout_custom = Some(StdioWriteHandler::new(callback, data, finalizer));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wasi_config_inherit_stdout(config: &mut wasi_config_t) {
     config.inherit_stdout = true;
+    config.stdout_custom = None;
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wasi_config_capture_stderr(config: &mut wasi_config_t) {
     config.inherit_stderr = false;
+    config.stderr_custom = None;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wasi_config_set_stderr_custom(
+    config: &mut wasi_config_t,
+    callback: wasi_config_write_callback_t,
+    data: *mut c_void,
+    finalizer: Option<unsafe extern "C" fn(env: *mut c_void)>,
+) {
+    config.inherit_stderr = false;
+    config.stderr_custom = Some(StdioWriteHandler::new(callback, data, finalizer));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wasi_config_inherit_stderr(config: &mut wasi_config_t) {
     config.inherit_stderr = true;
+    config.stderr_custom = None;
 }
 
 #[unsafe(no_mangle)]
@@ -356,19 +431,19 @@ unsafe fn wasi_env_instantiate_webc_inner(
             .ok()?;
     }
 
-    // Set up stdio pipes
+    // Set up stdio
     let mut stdout_rx = None;
     if !config.inherit_stdout {
-        let (stdout_tx, rx) = Pipe::channel();
-        builder.set_stdout(Box::new(stdout_tx));
-        stdout_rx = Some(rx);
+        let (stdout_file, rx) = create_output(config.stdout_custom.take(), 1);
+        builder.set_stdout(stdout_file);
+        stdout_rx = rx;
     }
 
     let mut stderr_rx = None;
     if !config.inherit_stderr {
-        let (stderr_tx, rx) = Pipe::channel();
-        builder.set_stderr(Box::new(stderr_tx));
-        stderr_rx = Some(rx);
+        let (stderr_file, rx) = create_output(config.stderr_custom.take(), 2);
+        builder.set_stderr(stderr_file);
+        stderr_rx = rx;
     }
 
     let mut stdin_tx = None;
@@ -391,10 +466,10 @@ unsafe fn wasi_env_instantiate_webc_inner(
     let (instance, func_env) = match wasi_env.instantiate(
         module.clone(),
         &mut store_mut,
-        None,   // memory (let the linker handle it)
-        true,   // update_layout
-        true,   // call_initialize
-        None,   // parent_linker_and_ctx
+        None, // memory (let the linker handle it)
+        true, // update_layout
+        true, // call_initialize
+        None, // parent_linker_and_ctx
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -441,12 +516,7 @@ unsafe fn wasi_env_with_filesystem_inner(
 
     let (wasi_env, import_object, stdout_rx, stderr_rx, stdin_tx) = {
         let mut store_mut = unsafe { store.store_mut() };
-        prepare_webc_env(
-            config,
-            &mut store_mut,
-            module,
-            slice,
-        )?
+        prepare_webc_env(config, &mut store_mut, module, slice)?
     };
 
     // Resolve imports, creating trap stubs for any that are missing.
@@ -473,7 +543,10 @@ unsafe fn wasi_env_with_filesystem_inner(
 #[cfg(feature = "webc_runner")]
 fn mount_webc_filesystem(
     webc_bytes: &[u8],
-) -> Option<(Arc<dyn wasmer_wasix::virtual_fs::FileSystem + Send + Sync>, Vec<String>)> {
+) -> Option<(
+    Arc<dyn wasmer_wasix::virtual_fs::FileSystem + Send + Sync>,
+    Vec<String>,
+)> {
     use virtual_fs::webc_volume_fs::WebcVolumeFileSystem;
     use wasmer_wasix::virtual_fs::FileSystem;
 
@@ -517,7 +590,13 @@ fn prepare_webc_env(
     store: &mut impl AsStoreMut,
     module: &Module,
     webc_bytes: &[u8],
-) -> Option<(WasiFunctionEnv, Imports, Option<Pipe>, Option<Pipe>, Option<Pipe>)> {
+) -> Option<(
+    WasiFunctionEnv,
+    Imports,
+    Option<Pipe>,
+    Option<Pipe>,
+    Option<Pipe>,
+)> {
     let store_mut = store.as_store_mut();
     let runtime = config.runtime.take();
 
@@ -539,16 +618,16 @@ fn prepare_webc_env(
 
     let mut stdout_rx = None;
     if !config.inherit_stdout {
-        let (stdout_tx, rx) = Pipe::channel();
-        builder.set_stdout(Box::new(stdout_tx));
-        stdout_rx = Some(rx);
+        let (stdout_file, rx) = create_output(config.stdout_custom.take(), 1);
+        builder.set_stdout(stdout_file);
+        stdout_rx = rx;
     }
 
     let mut stderr_rx = None;
     if !config.inherit_stderr {
-        let (stderr_tx, rx) = Pipe::channel();
-        builder.set_stderr(Box::new(stderr_tx));
-        stderr_rx = Some(rx);
+        let (stderr_file, rx) = create_output(config.stderr_custom.take(), 2);
+        builder.set_stderr(stderr_file);
+        stderr_rx = rx;
     }
 
     let mut stdin_tx = None;
@@ -567,7 +646,9 @@ fn prepare_webc_env(
     }
     let env = builder.finalize(store).ok()?;
 
-    let import_object = env.import_object_for_all_wasi_versions(store, module).ok()?;
+    let import_object = env
+        .import_object_for_all_wasi_versions(store, module)
+        .ok()?;
     Some((env, import_object, stdout_rx, stderr_rx, stdin_tx))
 }
 
@@ -576,9 +657,9 @@ pub struct wasi_env_t {
     /// cbindgen:ignore
     pub(super) inner: WasiFunctionEnv,
     pub(super) store: StoreRef,
-    /// Host-side read end for captured stdout
+    /// Host-side read end for captured stdout.
     stdout_rx: Option<Pipe>,
-    /// Host-side read end for captured stderr
+    /// Host-side read end for captured stderr.
     stderr_rx: Option<Pipe>,
     /// Host-side write end for captured stdin
     stdin_tx: Option<Pipe>,
@@ -621,16 +702,16 @@ pub unsafe extern "C" fn wasi_env_new(
 
     let mut stdout_rx = None;
     if !config.inherit_stdout {
-        let (stdout_tx, rx) = Pipe::channel();
-        config.builder.set_stdout(Box::new(stdout_tx));
-        stdout_rx = Some(rx);
+        let (stdout_file, rx) = create_output(config.stdout_custom.take(), 1);
+        config.builder.set_stdout(stdout_file);
+        stdout_rx = rx;
     }
 
     let mut stderr_rx = None;
     if !config.inherit_stderr {
-        let (stderr_tx, rx) = Pipe::channel();
-        config.builder.set_stderr(Box::new(stderr_tx));
-        stderr_rx = Some(rx);
+        let (stderr_file, rx) = create_output(config.stderr_custom.take(), 2);
+        config.builder.set_stderr(stderr_file);
+        stderr_rx = rx;
     }
 
     let mut stdin_tx = None;
@@ -649,26 +730,30 @@ pub unsafe extern "C" fn wasi_env_new(
             update_last_error(
                 "wasi_config_preopen_dir and wasi_config_mapdir cannot be used together; \
                  mapped directories use a sandboxed filesystem that preopened host paths \
-                 cannot resolve against"
+                 cannot resolve against",
             );
             return None;
         }
 
         // Normalize guest paths once: ensure leading "/" and pair with host dir.
-        let normalized: Vec<(String, PathBuf)> = config.mapped_dirs.iter().map(|(alias, host_dir)| {
-            let guest_path = if alias.starts_with('/') {
-                alias.clone()
-            } else {
-                format!("/{}", alias)
-            };
-            (guest_path, host_dir.clone())
-        }).collect();
+        let normalized: Vec<(String, PathBuf)> = config
+            .mapped_dirs
+            .iter()
+            .map(|(alias, host_dir)| {
+                let guest_path = if alias.starts_with('/') {
+                    alias.clone()
+                } else {
+                    format!("/{}", alias)
+                };
+                (guest_path, host_dir.clone())
+            })
+            .collect();
 
         // Use build_ext to exclude mapped guest paths from the default dirs,
         // avoiding AlreadyExists errors if an alias matches /bin, /tmp, etc.
         let guest_path_refs: Vec<&str> = normalized.iter().map(|(g, _)| g.as_str()).collect();
-        let root_fs = wasmer_wasix::virtual_fs::RootFileSystemBuilder::new()
-            .build_ext(&guest_path_refs);
+        let root_fs =
+            wasmer_wasix::virtual_fs::RootFileSystemBuilder::new().build_ext(&guest_path_refs);
         let host_fs = default_fs_backing();
 
         for (guest_path, host_dir) in &normalized {
@@ -685,12 +770,11 @@ pub unsafe extern "C" fn wasi_env_new(
                     }
                 }
             }
-            if let Err(e) = root_fs.mount(
-                PathBuf::from(guest_path),
-                &host_fs,
-                host_dir.clone(),
-            ) {
-                update_last_error(format!("Failed to mount {} -> {:?}: {}", guest_path, host_dir, e));
+            if let Err(e) = root_fs.mount(PathBuf::from(guest_path), &host_fs, host_dir.clone()) {
+                update_last_error(format!(
+                    "Failed to mount {} -> {:?}: {}",
+                    guest_path, host_dir, e
+                ));
                 return None;
             }
             // Use add_map_dir with the GUEST path (not the host path) since root_fs
@@ -704,9 +788,11 @@ pub unsafe extern "C" fn wasi_env_new(
         }
         // sandbox_fs() and preopen_dir() consume self, so swap the builder out and back.
         let builder = std::mem::replace(&mut config.builder, WasiEnv::builder(""));
-        let builder = c_try!(builder
-            .sandbox_fs(root_fs)
-            .preopen_dir(std::path::Path::new("/")));
+        let builder = c_try!(
+            builder
+                .sandbox_fs(root_fs)
+                .preopen_dir(std::path::Path::new("/"))
+        );
         config.builder = c_try!(builder.map_dir(".", "/"));
     } else {
         config.builder.set_fs(default_fs_backing());
@@ -747,7 +833,9 @@ pub unsafe extern "C" fn wasi_env_add_host_function(
     import_name: *const c_char,
     func: Option<&wasm_func_t>,
 ) -> bool {
-    let Some(wasi_env) = wasi_env else { return false };
+    let Some(wasi_env) = wasi_env else {
+        return false;
+    };
     let Some(func) = func else { return false };
     if module_name.is_null() || import_name.is_null() {
         return false;
@@ -842,6 +930,166 @@ fn write_pipe(pipe: &mut Pipe, buf: &[u8]) -> isize {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CallbackOutputFile {
+    handler: StdioWriteHandler,
+    special_fd: u32,
+}
+
+impl CallbackOutputFile {
+    fn new(handler: StdioWriteHandler, special_fd: u32) -> Self {
+        Self {
+            handler,
+            special_fd,
+        }
+    }
+
+    fn write_callback(&self, buf: &[u8]) -> io::Result<usize> {
+        let written = unsafe { (self.handler.callback)(self.handler.env, buf.as_ptr(), buf.len()) };
+
+        if written > 0 {
+            let written = written as usize;
+            if written > buf.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stdio callback reported more bytes than provided",
+                ));
+            }
+            return Ok(written);
+        }
+
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stdio callback refused write",
+            ));
+        }
+
+        let raw_errno = written
+            .checked_neg()
+            .and_then(|errno| i32::try_from(errno).ok())
+            .unwrap_or(libc::EIO);
+        Err(io::Error::from_raw_os_error(raw_errno))
+    }
+}
+
+impl tokio::io::AsyncRead for CallbackOutputFile {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl tokio::io::AsyncWrite for CallbackOutputFile {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(self.write_callback(buf))
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let mut total_written = 0usize;
+        for buf in bufs {
+            if buf.is_empty() {
+                continue;
+            }
+
+            match self.write_callback(buf) {
+                Ok(written) => {
+                    total_written += written;
+                    if written < buf.len() {
+                        break;
+                    }
+                }
+                Err(_) if total_written > 0 => return Poll::Ready(Ok(total_written)),
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+        }
+        Poll::Ready(Ok(total_written))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl tokio::io::AsyncSeek for CallbackOutputFile {
+    fn start_seek(self: Pin<&mut Self>, _position: io::SeekFrom) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        Poll::Ready(Err(io::ErrorKind::Unsupported.into()))
+    }
+}
+
+impl wasmer_wasix::virtual_fs::VirtualFile for CallbackOutputFile {
+    fn last_accessed(&self) -> u64 {
+        1_000_000_000
+    }
+
+    fn last_modified(&self) -> u64 {
+        1_000_000_000
+    }
+
+    fn created_time(&self) -> u64 {
+        1_000_000_000
+    }
+
+    fn size(&self) -> u64 {
+        0
+    }
+
+    fn set_len(&mut self, _new_size: u64) -> wasmer_wasix::virtual_fs::Result<()> {
+        Ok(())
+    }
+
+    fn unlink(&mut self) -> wasmer_wasix::virtual_fs::Result<()> {
+        Ok(())
+    }
+
+    fn get_special_fd(&self) -> Option<u32> {
+        Some(self.special_fd)
+    }
+
+    fn poll_read_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(0))
+    }
+
+    fn poll_write_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(usize::MAX))
+    }
+}
+
+fn create_output(
+    custom: Option<StdioWriteHandler>,
+    special_fd: u32,
+) -> (
+    Box<dyn wasmer_wasix::virtual_fs::VirtualFile + Send + Sync + 'static>,
+    Option<Pipe>,
+) {
+    match custom {
+        Some(handler) => (Box::new(CallbackOutputFile::new(handler, special_fd)), None),
+        None => {
+            let (tx, rx) = Pipe::channel();
+            (Box::new(tx), Some(rx))
+        }
+    }
+}
+
 /// Write data to the captured stdin pipe.
 ///
 /// Returns the number of bytes written, or -1 on error (e.g., stdin was not
@@ -925,7 +1173,9 @@ pub unsafe extern "C" fn wasi_start(
 ) -> Option<Box<crate::wasm_c_api::trap::wasm_trap_t>> {
     // Enter the tokio runtime so WASIX child tasks can be scheduled
     let Some(handle) = wasi_env.runtime_handle.as_ref() else {
-        update_last_error("wasi_start requires a tokio runtime; use wasi_env_new (not wasi_env_with_filesystem)");
+        update_last_error(
+            "wasi_start requires a tokio runtime; use wasi_env_new (not wasi_env_with_filesystem)",
+        );
         return Some(Box::new(crate::wasm_c_api::trap::wasm_trap_t::from(
             wasmer_api::RuntimeError::new("No tokio runtime handle available"),
         )));
@@ -953,11 +1203,7 @@ pub unsafe extern "C" fn wasi_start(
     // requires Store by value.
     let result = unsafe {
         store.inner.with_owned_store(|owned_store| {
-            wasmer_wasix::bin_factory::run_wasi_entrypoint(
-                &wasi_env.inner,
-                owned_store,
-                start,
-            )
+            wasmer_wasix::bin_factory::run_wasi_entrypoint(&wasi_env.inner, owned_store, start)
         })
     };
 
@@ -988,33 +1234,25 @@ pub unsafe extern "C" fn wasi_start(
 /// fallback if the process terminated with an error that could not be
 /// mapped to an exit code (e.g., asyncify corruption).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wasi_env_get_exit_code(
-    wasi_env: &wasi_env_t,
-) -> i32 {
+pub unsafe extern "C" fn wasi_env_get_exit_code(wasi_env: &wasi_env_t) -> i32 {
     let store = unsafe { wasi_env.store.store() };
     let env = wasi_env.inner.env.as_ref(&store);
     match env.process.try_join() {
         Some(Ok(code)) => code.raw(),
         Some(Err(err)) => {
-            err.as_exit_code()
-                .map(|c| c.raw())
-                .unwrap_or_else(|| {
-                    // Asyncify may have corrupted the error; fall back to
-                    // the exit code stored by proc_exit before unwinding.
-                    let explicit = env.process.explicit_exit_code();
-                    if explicit >= 0 { explicit } else { 1 }
-                })
+            err.as_exit_code().map(|c| c.raw()).unwrap_or_else(|| {
+                // Asyncify may have corrupted the error; fall back to
+                // the exit code stored by proc_exit before unwinding.
+                let explicit = env.process.explicit_exit_code();
+                if explicit >= 0 { explicit } else { 1 }
+            })
         }
         None => -1,
     }
 }
 
 /// Save a compiled module to the runtime's module cache under the given hash.
-fn save_module_to_cache(
-    wasi_env: &wasi_env_t,
-    hash: ModuleHash,
-    module: &wasm_module_t,
-) -> bool {
+fn save_module_to_cache(wasi_env: &wasi_env_t, hash: ModuleHash, module: &wasm_module_t) -> bool {
     let store = unsafe { wasi_env.store.store() };
     let env = wasi_env.inner.env.as_ref(&store);
     let runtime = env.runtime.clone();
@@ -1178,9 +1416,11 @@ unsafe fn wasi_get_imports_inner(
 
     let mut import_object = {
         let mut store_mut = unsafe { store.store_mut() };
-        c_try!(wasi_env
-            .inner
-            .import_object_for_all_wasi_versions(&mut store_mut, &module.inner))
+        c_try!(
+            wasi_env
+                .inner
+                .import_object_for_all_wasi_versions(&mut store_mut, &module.inner)
+        )
     };
 
     let shared_memory = module.inner.imports().memories().next().map(|a| *a.ty());
@@ -1236,7 +1476,10 @@ fn imports_set_buffer_with_stubs(
     {
         let mut store_mut = unsafe { store.store_mut() };
         for import_type in module.imports() {
-            if import_object.get_export(import_type.module(), import_type.name()).is_some() {
+            if import_object
+                .get_export(import_type.module(), import_type.name())
+                .is_some()
+            {
                 continue;
             }
             if let wasmer_api::ExternType::Function(func_ty) = import_type.ty() {
@@ -1339,10 +1582,72 @@ pub unsafe extern "C" fn wasi_get_start_function(
 
 #[cfg(test)]
 mod tests {
+    use super::{CallbackOutputFile, StdioWriteHandler, block_on, wasi_config_write_callback_t};
     #[cfg(not(target_os = "windows"))]
     use inline_c::assert_c;
+    use libc::ptrdiff_t;
+    use std::io::ErrorKind;
+    use std::os::raw::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::AsyncWriteExt;
     #[cfg(target_os = "windows")]
     use wasmer_inline_c::assert_c;
+
+    #[derive(Debug)]
+    struct TestCallbackState {
+        writes: Arc<Mutex<Vec<u8>>>,
+        finalizer_hits: Arc<AtomicUsize>,
+    }
+
+    unsafe extern "C" fn collecting_callback(
+        env: *mut c_void,
+        bytes: *const u8,
+        len: usize,
+    ) -> ptrdiff_t {
+        let state = unsafe { &*(env as *mut TestCallbackState) };
+        let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
+        state.writes.lock().unwrap().extend_from_slice(bytes);
+        len as ptrdiff_t
+    }
+
+    unsafe extern "C" fn zero_callback(
+        _env: *mut c_void,
+        _bytes: *const u8,
+        _len: usize,
+    ) -> ptrdiff_t {
+        0
+    }
+
+    unsafe extern "C" fn errno_callback(
+        _env: *mut c_void,
+        _bytes: *const u8,
+        _len: usize,
+    ) -> ptrdiff_t {
+        -(libc::EPIPE as ptrdiff_t)
+    }
+
+    unsafe extern "C" fn callback_state_finalizer(env: *mut c_void) {
+        let state = unsafe { Box::from_raw(env as *mut TestCallbackState) };
+        state.finalizer_hits.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn make_callback_file(
+        callback: wasi_config_write_callback_t,
+    ) -> (CallbackOutputFile, Arc<Mutex<Vec<u8>>>, Arc<AtomicUsize>) {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let finalizer_hits = Arc::new(AtomicUsize::new(0));
+        let state = Box::new(TestCallbackState {
+            writes: writes.clone(),
+            finalizer_hits: finalizer_hits.clone(),
+        });
+        let handler = StdioWriteHandler::new(
+            callback,
+            Box::into_raw(state) as *mut c_void,
+            Some(callback_state_finalizer),
+        );
+        (CallbackOutputFile::new(handler, 1), writes, finalizer_hits)
+    }
 
     #[allow(
         unexpected_cfgs,
@@ -1561,5 +1866,57 @@ mod tests {
             }
         })
         .success();
+    }
+
+    #[allow(
+        unexpected_cfgs,
+        reason = "tools like cargo-llvm-coverage pass --cfg coverage"
+    )]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[test]
+    fn test_callback_output_file_writes_to_callback() {
+        let (mut file, writes, finalizer_hits) = make_callback_file(collecting_callback);
+
+        block_on(async {
+            file.write_all(b"hello world").await.unwrap();
+        });
+
+        assert_eq!(writes.lock().unwrap().as_slice(), b"hello world");
+        drop(file);
+        assert_eq!(finalizer_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_callback_output_file_zero_return_maps_to_broken_pipe() {
+        let (mut file, _writes, finalizer_hits) = make_callback_file(zero_callback);
+
+        let err = block_on(async { file.write_all(b"hello").await.unwrap_err() });
+        assert_eq!(err.kind(), ErrorKind::BrokenPipe);
+
+        drop(file);
+        assert_eq!(finalizer_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_callback_output_file_negative_errno_maps_to_io_error() {
+        let (mut file, _writes, finalizer_hits) = make_callback_file(errno_callback);
+
+        let err = block_on(async { file.write_all(b"hello").await.unwrap_err() });
+        assert_eq!(err.raw_os_error(), Some(libc::EPIPE));
+
+        drop(file);
+        assert_eq!(finalizer_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_callback_output_file_finalizer_runs_once_across_clones() {
+        let (file, _writes, finalizer_hits) = make_callback_file(collecting_callback);
+        let file_clone = file.clone();
+
+        drop(file);
+        assert_eq!(finalizer_hits.load(Ordering::SeqCst), 0);
+
+        drop(file_clone);
+        assert_eq!(finalizer_hits.load(Ordering::SeqCst), 1);
     }
 }

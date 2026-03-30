@@ -107,6 +107,7 @@ compiler-headless = [
 	"wasmer-artifact-load",
 	"static-artifact-load",
 	"wasmer-api/compiler",
+	"wasmer-api/headless",
 	"wasmer-compiler/translator",
 	"wasmer-compiler/compiler",
 ]

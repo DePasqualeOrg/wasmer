@@ -48,6 +48,13 @@ pub(crate) fn path_remove_directory_internal(
     let env = ctx.data();
     let (memory, state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
 
+    // Resolve the full path first so the child inode is lazy-loaded into
+    // the parent's entries cache (same pattern used by path_unlink_file).
+    // Without this, a WASI instance that hasn't traversed the parent
+    // directory yet would fail with Noent because the in-memory entries
+    // map is empty.
+    let _child_inode = state.fs.get_inode_at_path(inodes, fd, path, true)?;
+
     let (parent_inode, dir_name) =
         state
             .fs

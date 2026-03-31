@@ -234,6 +234,7 @@ fn apply_fd_op<M: MemorySize>(
                     ..fd_entry.inner
                 },
                 inode: fd_entry.inode.clone(),
+                readdir_state: fd_entry.readdir_state.clone(),
                 ..*fd_entry
             };
 

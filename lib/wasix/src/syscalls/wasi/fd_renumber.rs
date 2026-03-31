@@ -91,6 +91,7 @@ pub(crate) fn fd_renumber_internal(
                 ..fd_entry.inner
             },
             inode: fd_entry.inode.clone(),
+            readdir_state: fd_entry.readdir_state.clone(),
             ..*fd_entry
         };
 

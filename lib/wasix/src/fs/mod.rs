@@ -1590,6 +1590,7 @@ impl WasiFs {
                 open_flags: 0,
                 inode: self.root_inode.clone(),
                 is_stdio: false,
+                readdir_state: Default::default(),
             })
         } else {
             ret
@@ -1927,6 +1928,7 @@ impl WasiFs {
             open_flags,
             inode,
             is_stdio,
+            readdir_state: Default::default(),
         };
 
         let mut guard = self.fd_map.write().unwrap();
@@ -1973,6 +1975,7 @@ impl WasiFs {
                 open_flags: fd.open_flags,
                 inode: fd.inode,
                 is_stdio: fd.is_stdio,
+                readdir_state: fd.readdir_state.clone(),
             },
             min_result_fd,
         ))
@@ -2287,6 +2290,7 @@ impl WasiFs {
                 open_flags: 0,
                 inode,
                 is_stdio: true,
+                readdir_state: Default::default(),
             },
         );
     }

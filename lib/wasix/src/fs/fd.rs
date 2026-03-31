@@ -2,13 +2,13 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, atomic::AtomicU64},
+    sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, atomic::AtomicU64},
 };
 
 #[cfg(feature = "enable-serde")]
 use serde_derive::{Deserialize, Serialize};
 use virtual_fs::{Pipe, PipeRx, PipeTx, VirtualFile};
-use wasmer_wasix_types::wasi::{Fd as WasiFd, Fdflags, Fdflagsext, Filestat, Rights};
+use wasmer_wasix_types::wasi::{Fd as WasiFd, Fdflags, Fdflagsext, Filestat, Filetype, Rights};
 
 use crate::net::socket::InodeSocket;
 use crate::os::epoll::EpollState;
@@ -27,6 +27,8 @@ pub struct Fd {
     pub open_flags: u16,
     pub inode: InodeGuard,
     pub is_stdio: bool,
+    #[cfg_attr(feature = "enable-serde", serde(skip, default))]
+    pub readdir_state: Arc<Mutex<Option<Arc<Vec<(String, Filetype, u64)>>>>>,
 }
 
 // This struct contains the bits of Fd that are safe to mutate, so that

@@ -319,6 +319,7 @@ mod tests {
                 open_handles: Arc::new(AtomicI32::new(0)),
             },
             is_stdio: false,
+            readdir_state: Default::default(),
             inner: FdInner {
                 offset: Arc::new(AtomicU64::new(0)),
                 rights: Rights::empty(),

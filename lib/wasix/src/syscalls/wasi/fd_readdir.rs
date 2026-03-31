@@ -1,6 +1,81 @@
 use super::*;
 use crate::syscalls::*;
 
+type DirEntrySnapshot = Arc<Vec<(String, Filetype, u64)>>;
+
+fn collect_directory_entries(
+    working_dir: &Fd,
+    state: &WasiState,
+) -> std::result::Result<DirEntrySnapshot, Errno> {
+    let entries: Vec<(String, Filetype, u64)> = {
+        let guard = working_dir.inode.read();
+        match guard.deref() {
+            Kind::Dir { path, entries, .. } => {
+                trace!("reading dir {:?}", path);
+                let fs_info = state
+                    .fs_read_dir(path)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(fs_error_into_wasi_err)?;
+                let mut entry_vec = fs_info
+                    .into_iter()
+                    .map(|entry| {
+                        let filename = entry.file_name().to_string_lossy().to_string();
+                        trace!("getting file: {:?}", filename);
+                        let filetype = virtual_file_type_to_wasi_file_type(
+                            entry.file_type().map_err(fs_error_into_wasi_err)?,
+                        );
+                        Ok((filename, filetype, 0))
+                    })
+                    .collect::<std::result::Result<Vec<(String, Filetype, u64)>, Errno>>()?;
+                entry_vec.extend(entries.iter().filter(|(_, inode)| inode.is_preopened).map(
+                    |(name, inode)| {
+                        let stat = inode.stat.read().unwrap();
+                        (
+                            inode.name.read().unwrap().to_string(),
+                            stat.st_filetype,
+                            stat.st_ino,
+                        )
+                    },
+                ));
+                entry_vec.push((".".to_string(), Filetype::Directory, 0));
+                entry_vec.push(("..".to_string(), Filetype::Directory, 0));
+                entry_vec.sort_by(|a, b| a.0.cmp(&b.0));
+                entry_vec
+            }
+            Kind::Root { entries } => {
+                trace!("reading root");
+                let mut entry_vec: Vec<(String, InodeGuard)> = entries
+                    .iter()
+                    .map(|(a, b)| (a.clone(), b.clone()))
+                    .collect();
+                entry_vec.sort_by(|a, b| a.0.cmp(&b.0));
+                entry_vec
+                    .into_iter()
+                    .map(|(_name, inode)| {
+                        let stat = inode.stat.read().unwrap();
+                        (
+                            format!("/{}", inode.name.read().unwrap().as_ref()),
+                            stat.st_filetype,
+                            stat.st_ino,
+                        )
+                    })
+                    .collect()
+            }
+            Kind::File { .. }
+            | Kind::Symlink { .. }
+            | Kind::Buffer { .. }
+            | Kind::Socket { .. }
+            | Kind::PipeRx { .. }
+            | Kind::PipeTx { .. }
+            | Kind::DuplexPipe { .. }
+            | Kind::EventNotifications { .. }
+            | Kind::Epoll { .. } => return Err(Errno::Notdir),
+        }
+    };
+
+    Ok(Arc::new(entries))
+}
+
 /// ### `fd_readdir()`
 /// Read data from directory specified by file descriptor
 /// Inputs:
@@ -37,84 +112,12 @@ pub fn fd_readdir<M: MemorySize>(
     let working_dir = wasi_try_ok!(state.fs.get_fd(fd));
     let mut buf_idx = 0usize;
 
-    let entries: Vec<(String, Filetype, u64)> = {
-        let guard = working_dir.inode.read();
-        match guard.deref() {
-            Kind::Dir { path, entries, .. } => {
-                trace!("reading dir {:?}", path);
-                // TODO: refactor this code
-                // we need to support multiple calls,
-                // simple and obviously correct implementation for now:
-                // maintain consistent order via lexacographic sorting
-                let fs_info = wasi_try_ok!(
-                    wasi_try_ok!(state.fs_read_dir(path))
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(fs_error_into_wasi_err)
-                );
-                let mut entry_vec = wasi_try_ok!(
-                    fs_info
-                        .into_iter()
-                        .map(|entry| {
-                            let filename = entry.file_name().to_string_lossy().to_string();
-                            trace!("getting file: {:?}", filename);
-                            let filetype = virtual_file_type_to_wasi_file_type(
-                                entry.file_type().map_err(fs_error_into_wasi_err)?,
-                            );
-                            Ok((
-                                filename, filetype, 0, // TODO: inode
-                            ))
-                        })
-                        .collect::<Result<Vec<(String, Filetype, u64)>, _>>()
-                );
-                entry_vec.extend(entries.iter().filter(|(_, inode)| inode.is_preopened).map(
-                    |(name, inode)| {
-                        let stat = inode.stat.read().unwrap();
-                        (
-                            inode.name.read().unwrap().to_string(),
-                            stat.st_filetype,
-                            stat.st_ino,
-                        )
-                    },
-                ));
-                // adding . and .. special folders
-                // TODO: inode
-                entry_vec.push((".".to_string(), Filetype::Directory, 0));
-                entry_vec.push(("..".to_string(), Filetype::Directory, 0));
-                entry_vec.sort_by(|a, b| a.0.cmp(&b.0));
-                entry_vec
-            }
-            Kind::Root { entries } => {
-                trace!("reading root");
-                let sorted_entries = {
-                    let mut entry_vec: Vec<(String, InodeGuard)> = entries
-                        .iter()
-                        .map(|(a, b)| (a.clone(), b.clone()))
-                        .collect();
-                    entry_vec.sort_by(|a, b| a.0.cmp(&b.0));
-                    entry_vec
-                };
-                sorted_entries
-                    .into_iter()
-                    .map(|(name, inode)| {
-                        let stat = inode.stat.read().unwrap();
-                        (
-                            format!("/{}", inode.name.read().unwrap().as_ref()),
-                            stat.st_filetype,
-                            stat.st_ino,
-                        )
-                    })
-                    .collect()
-            }
-            Kind::File { .. }
-            | Kind::Symlink { .. }
-            | Kind::Buffer { .. }
-            | Kind::Socket { .. }
-            | Kind::PipeRx { .. }
-            | Kind::PipeTx { .. }
-            | Kind::DuplexPipe { .. }
-            | Kind::EventNotifications { .. }
-            | Kind::Epoll { .. } => return Ok(Errno::Notdir),
+    let entries = {
+        let mut readdir_state = working_dir.readdir_state.lock().unwrap();
+        if cookie == 0 || readdir_state.is_none() {
+            *readdir_state = Some(wasi_try_ok!(collect_directory_entries(&working_dir, state)));
         }
+        readdir_state.as_ref().cloned().unwrap()
     };
 
     for (cur_cookie, (entry_path_str, wasi_file_type, ino)) in
